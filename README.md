@@ -1,116 +1,234 @@
-# San-o1 — IA d'échecs neuronale (AlphaZero/Lc0-like)
+<div align="center">
 
-Moteur d'échecs à base de **réseau de neurones** (ResNet politique + valeur) avec
-**recherche MCTS PUCT**, pré-entraîné en **supervisé sur les parties Lichess**, et
-capable d'**apprendre en continu** à partir des parties Lichess en temps réel —
-les nouveaux poids sont **rechargés à chaud** par le moteur pendant que tu joues.
+# San-o1 ♟️🧠
 
-Le moteur parle le protocole **UCI** : tu peux le brancher dans n'importe quelle
-interface d'échecs (Nibbler, Cutechess, Arena) ou en faire un bot Lichess.
+**A neural chess engine that learns in real time from Lichess.**
 
-> ⚠️ **Réalisme** : atteindre un niveau « super-GM » type AlphaZero *from scratch*
-> demande des milliers de TPU. Sur un seul GPU grand public (ici une RTX 2070
-> SUPER), l'objectif réaliste est un niveau **club fort → expert**, atteint
-> rapidement par le pré-entraînement supervisé, qui continue de progresser avec
-> le fine-tuning en ligne. L'architecture (ResNet + MCTS) *scale* si tu ajoutes
-> du calcul plus tard (plus de blocs/canaux, plus de données, self-play).
+AlphaZero/Lc0-style architecture — ResNet policy + value network, PUCT Monte-Carlo Tree Search,
+supervised pre-training on Lichess games, and **continuous online learning** with live hot-reload.
+Ships as a **UCI engine** and a **native Lichess bot**.
+
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white)
+![CUDA](https://img.shields.io/badge/CUDA-enabled-76B900?logo=nvidia&logoColor=white)
+![Lichess](https://img.shields.io/badge/Lichess-BOT_API-000000?logo=lichess&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green)
+
+</div>
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [How it works](#how-it-works)
+- [Hardware](#hardware)
+- [Installation](#installation)
+- [Quickstart](#quickstart)
+- [Project structure](#project-structure)
+- [Configuration](#configuration)
+- [Training pipeline](#training-pipeline)
+- [Evaluating strength](#evaluating-strength)
+- [Roadmap](#roadmap)
+- [Disclaimer](#disclaimer)
+- [License](#license)
+
+---
+
+## Overview
+
+San-o1 is a from-scratch chess engine built around a deep residual network and neural
+Monte-Carlo Tree Search, in the spirit of **AlphaZero** and **Leela Chess Zero**.
+
+It is **bootstrapped by supervised learning** on millions of Lichess games (fast path to a
+strong baseline), then **keeps improving online** by streaming live high-rated games and
+fine-tuning continuously. The playing engine **hot-reloads the latest weights between games**,
+so the bot literally gets stronger while it runs.
+
+Two ways to play it:
+
+- **UCI engine** — plug it into any chess GUI (Nibbler, Cutechess, Arena).
+- **Native Lichess bot** — connects to the Lichess Bot API and plays online directly.
+
+## Features
+
+- 🧠 **ResNet policy + value network** (configurable, default **20×256 ≈ 33M params**).
+- 🌲 **PUCT MCTS** with batched GPU leaf evaluation, virtual loss, and Dirichlet root noise (self-play).
+- 📚 **Supervised pre-training** on Lichess monthly dumps — streamed and decompressed on the fly (no 30 GB download).
+- 🔄 **Continuous online learning** from live Lichess games, with a sliding replay buffer to limit catastrophic forgetting.
+- ♻️ **Hot-reload** — the engine picks up newly trained weights at the start of each game.
+- 🔌 **UCI protocol** + 🤖 **native Lichess bot** (challenge handling, clock-aware time management).
+- 🧪 Unit-tested move ↔ index encoding (round-trip verified over thousands of positions).
+- ⚡ Mixed-precision training (AMP) — the default network uses ~1.3 GB VRAM at batch 512.
+
+## How it works
+
+```
+                    ┌──────────────────────────────────────────────┐
+   Lichess DB       │                  TRAINING                     │
+  (monthly dumps) ──┼─► pgn_to_samples ─► shards ─┐                 │
+                    │                              ├─► pretrain.py ──┼─► checkpoints/latest.pt
+  Lichess API       │                              │                 │          │
+  (live games)   ───┼─► stream.py ─► replay buffer ┴─► online.py ────┘          │ hot-reload
+                    └──────────────────────────────────────────────┘          ▼
+                                                                    ┌──────────────────────┐
+                    Board ──► encoding (19×8×8 planes) ──► ResNet ──►│  policy(4672)+value  │
+                                                                    └──────────┬───────────┘
+                                                                               ▼
+                                                                       PUCT MCTS search
+                                                                               ▼
+                                                      ┌────────────────────────┴───────────┐
+                                                      │  UCI engine        Lichess bot      │
+                                                      │  (Nibbler/...)     (@Evil2Root)      │
+                                                      └────────────────────────────────────┘
+```
+
+**Board encoding** — 19 planes of 8×8 (12 piece planes, side-to-move, castling rights,
+fifty-move counter, en-passant), canonicalised to the side-to-move perspective.
+
+**Move encoding** — the AlphaZero `64 × 73 = 4672` policy head (56 "queen" moves, 8 knight
+moves, 9 underpromotions per square); illegal moves are masked using `python-chess`.
+
+**Search** — PUCT selection `Q + c_puct · P · √N / (1 + n)`, network priors for expansion,
+value backup with alternating sign, batched leaf evaluation for GPU throughput.
+
+## Hardware
+
+Developed and tested on an **NVIDIA RTX 2070 SUPER (8 GB)**. The default `20×256` network
+trains at ~5 steps/s (batch 512, AMP) using ~1.3 GB of VRAM, leaving plenty of headroom to
+scale the network up. CPU-only inference works but is slow.
 
 ## Installation
 
 ```bash
+git clone https://github.com/bastienjavx/Evil2Root-Chess-Bot.git
+cd Evil2Root-Chess-Bot
+
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-# (PyTorch s'installe avec CUDA par défaut ; vérifie : python -c "import torch;print(torch.cuda.is_available())")
+# PyTorch ships with CUDA by default — verify:
+python -c "import torch; print(torch.cuda.is_available())"
 ```
 
-## Démarrage rapide (pipeline complet)
+For the Lichess bot, set a token (scope `bot:play`) — put it in a local `.env` (git-ignored):
 
 ```bash
-# 1. Télécharger un dump mensuel Lichess (plusieurs Go)
-python -m sanchess.data.download 2024-01
-
-# 2. Convertir en samples (positions, coups, résultats), filtré par Elo
-python -m sanchess.data.pgn_to_samples data/lichess_raw/lichess_db_standard_rated_2024-01.pgn.zst \
-    --out data/shards --max-games 200000
-
-# 3. Pré-entraîner le réseau (écrit checkpoints/latest.pt)
-python -m sanchess.train.pretrain --shards data/shards
-
-# 4. Jouer : brancher le moteur UCI dans une GUI
-python -m sanchess.uci          # ou ./scripts/run_uci.sh
-
-# 5. (optionnel) Apprentissage continu : stream Lichess + entraînement de fond
-export LICHESS_TOKEN=ton_token  # optionnel, augmente les limites API
-./scripts/run_online.sh
+echo "LICHESS_TOKEN=lip_xxxxxxxxxxxxxxxx" > .env
 ```
 
-Pendant que `run_online.sh` tourne, il met à jour `checkpoints/latest.pt` ; le
-moteur UCI recharge ces poids automatiquement à chaque nouvelle partie
-(`ucinewgame`) → l'IA s'améliore en continu.
+## Quickstart
 
-## Utiliser le moteur dans une interface de jeu
+### 1 — Collect data & pre-train
 
-Le binaire UCI est `python -m sanchess.uci`. Dans la GUI, ajoute un « nouveau
-moteur UCI » pointant vers `scripts/run_uci.sh`.
+```bash
+# Stream a Lichess dump (Elo-filtered) and train, in one command:
+MONTH=2019-01 MAXG=50000 ./scripts/collect_and_train.sh
+```
 
-- **Nibbler** (recommandé) : affiche l'arbre MCTS comme Leela — idéal pour ce moteur.
-- **Cutechess** : pour organiser des matchs (ex. estimer l'Elo contre Stockfish bridé).
-- **Arena** : GUI Windows classique.
-- **lichess-bot** : pour le faire jouer en ligne sur Lichess (compte BOT requis).
+This streams games, builds shards under `data/shards/`, then trains, writing
+`checkpoints/latest.pt` every few minutes.
 
-Commandes UCI supportées : `uci`, `isready`, `ucinewgame`, `position`,
-`go nodes N` / `go movetime ms` / `go wtime .. btime ..`, `stop`, `quit`.
+### 2 — Play it in a GUI (UCI)
 
-## Structure
+```bash
+./scripts/run_uci.sh        # python -m sanchess.uci
+```
+
+Add it as a UCI engine in **Nibbler** (shows the MCTS tree, like Leela), **Cutechess**, or **Arena**.
+
+### 3 — Run the Lichess bot
+
+```bash
+python -m sanchess.lichess_bot --check     # show account status (read-only)
+./scripts/run_bot.sh                        # go online and accept challenges
+```
+
+> ⚠️ Converting an account to a BOT (`--upgrade`) is **irreversible** and only works on an
+> account that has never played a game.
+
+### 4 — Continuous learning
+
+```bash
+./scripts/run_online.sh     # live stream + background fine-tuning (after pre-training converges)
+```
+
+The collector feeds a replay buffer from live games while the trainer fine-tunes and refreshes
+`checkpoints/latest.pt`; the engine hot-reloads it between games.
+
+## Project structure
 
 ```
 sanchess/
-  encoding.py      plans 8x8 (style AlphaZero) + mapping coups<->index (4672)
-  model.py         ResNet : têtes politique (4672) & valeur (tanh)
-  search/mcts.py   MCTS PUCT, évaluation batchée GPU, hot-reload-friendly
-  uci.py           moteur UCI + rechargement à chaud des poids
-  data/
-    download.py        dumps mensuels Lichess (.pgn.zst)
-    pgn_to_samples.py  PGN -> shards (fen, coup, valeur), filtre Elo
-    stream.py          parties Lichess en temps réel -> replay buffer
-    samples.py         format de samples partagé (gzip texte)
-  train/
-    dataset.py     Dataset PyTorch (encodage à la volée)
-    pretrain.py    pré-entraînement supervisé (+ AMP)
-    online.py      entraînement continu + checkpoints hot-reload
-config.yaml        tous les hyperparamètres (réseau, MCTS, entraînement)
-tests/             tests d'encodage (round-trip coup<->index)
+├── encoding.py            8×8 planes + move ↔ index (4672) mapping
+├── model.py               ResNet: policy (4672) & value (tanh) heads
+├── uci.py                 UCI engine + weight hot-reload
+├── lichess_bot.py         native Lichess Bot API client
+├── utils.py               config / checkpoints / .env loader
+├── search/
+│   └── mcts.py            batched PUCT Monte-Carlo Tree Search
+├── data/
+│   ├── download.py        Lichess monthly dumps (.pgn.zst)
+│   ├── pgn_to_samples.py  PGN → shards (streamed, Elo-filtered)
+│   ├── stream.py          live Lichess games → replay buffer
+│   └── samples.py         shared sample format (gzip text)
+└── train/
+    ├── dataset.py         PyTorch dataset (on-the-fly encoding)
+    ├── pretrain.py        supervised pre-training (AMP)
+    └── online.py          continuous learning + hot-reload checkpoints
+scripts/                   one-command launchers
+tests/                     encoding round-trip tests
+config.yaml                all hyperparameters
 ```
 
-## Réglages clés (`config.yaml`)
+## Configuration
 
-- `model.channels` / `model.blocks` : taille du réseau (8 Go tiennent bien plus
-  large que le défaut 128×10 — augmente pour plus de force, au prix de la vitesse).
-- `mcts.default_nodes`, `mcts.c_puct`, `mcts.eval_batch_size` : force/vitesse de la recherche.
-- `data.min_elo`, `data.exclude_bullet` : qualité des données d'entraînement.
-- `online.lr`, `online.buffer_capacity` : agressivité de l'apprentissage continu
-  (LR faible + gros buffer = moins d'oubli catastrophique).
+All knobs live in [`config.yaml`](config.yaml):
 
-## Tests
+| Section | Key | Purpose |
+|---|---|---|
+| `model` | `channels`, `blocks` | network size (default 256×20; scale up for strength) |
+| `mcts` | `c_puct`, `default_nodes`, `eval_batch_size` | search strength / speed |
+| `train` | `batch_size`, `lr`, `amp` | pre-training |
+| `online` | `lr`, `buffer_capacity`, `min_buffer` | continuous-learning aggressiveness |
+| `data` | `min_elo`, `exclude_bullet` | training-data quality filter |
+| `bot` | `accept_variants`, `max_think_seconds` | Lichess bot behaviour |
 
-```bash
-python -m tests.test_encoding     # round-trip coup<->index, formes des plans
-```
+## Training pipeline
 
-## Évaluer la force
+1. **Supervised pre-training** — cross-entropy on the played move + MSE on the game result
+   (from the side-to-move perspective). Reaches a solid baseline quickly.
+2. **Online fine-tuning** — small learning rate over a sliding window of recent + seeded
+   games, to keep improving without forgetting.
+3. **Checkpoints** are written atomically (`tmp` + rename) so the engine can hot-reload safely.
 
-Organise un match dans Cutechess contre Stockfish à niveau/Elo limité
-(`UCI_LimitStrength`) pour estimer l'Elo et suivre la progression au fil de
-l'entraînement.
+To avoid two trainers fighting over `latest.pt`, run online learning **after** pre-training
+finishes (see `scripts/online_after_pretrain.sh`).
 
-## Pistes pour aller plus loin
-- Réseau plus gros (20×256) + plus de données → plus fort.
-- Tête **WDL** (3 classes) au lieu d'une valeur scalaire.
-- **Self-play** + apprentissage par renforcement (AlphaZero) une fois la base supervisée solide.
-- Export **ONNX/TensorRT** pour accélérer l'inférence MCTS.
-- Cache de transposition dans le MCTS.
+## Evaluating strength
 
-## Respect de Lichess
-`stream.py` respecte la ToS Lichess : throttling entre requêtes et gestion des
-erreurs 429. Un token API (`LICHESS_TOKEN`) est optionnel mais recommandé.
+Run a match in **Cutechess** against Stockfish with `UCI_LimitStrength` / a fixed Elo to
+estimate rating and track progress across checkpoints.
+
+## Roadmap
+
+- [ ] Larger network (e.g. 20×384) and more training data
+- [ ] WDL (win/draw/loss) value head
+- [ ] Self-play reinforcement learning on top of the supervised base
+- [ ] Transposition table / tree reuse between moves
+- [ ] ONNX / TensorRT export for faster MCTS inference
+
+## Disclaimer
+
+Reaching "super-GM / AlphaZero" strength from scratch requires thousands of TPUs. On a single
+consumer GPU the realistic target is **strong club → expert** level, reached quickly via
+supervised pre-training and improving continuously with online learning. The architecture
+(ResNet + MCTS) scales cleanly if you add more compute and data.
+
+This project uses the Lichess API in accordance with its
+[Terms of Service](https://lichess.org/terms-of-service) (request throttling, 429 backoff).
+
+## License
+
+Released under the [MIT License](LICENSE).
