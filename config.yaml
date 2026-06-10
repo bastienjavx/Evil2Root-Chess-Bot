@@ -1,0 +1,56 @@
+# Configuration San-o1 — IA d'échecs neuronale (AlphaZero/Lc0-like)
+
+model:
+  channels: 256          # filtres des blocs résiduels (réseau agrandi)
+  blocks: 20             # nombre de blocs résiduels (20x256 ~ petit Lc0)
+  policy_size: 4672      # 64 cases x 73 types de coups (encodage AlphaZero) — NE PAS changer
+  value_head: scalar     # "scalar" (tanh) — réservé pour extension WDL
+
+mcts:
+  c_puct: 1.5
+  default_nodes: 800     # budget par défaut si la GUI ne donne ni temps ni nodes
+  eval_batch_size: 16    # feuilles évaluées par batch GPU
+  dirichlet_alpha: 0.3   # bruit racine (self-play uniquement)
+  dirichlet_eps: 0.0     # 0 en match (mettre ~0.25 pour exploration self-play)
+  fpu: 0.2               # First Play Urgency (réduction pour fils non visités)
+
+train:
+  device: cuda           # "cuda" ou "cpu"
+  batch_size: 512
+  lr: 0.001
+  weight_decay: 0.0001
+  value_loss_weight: 1.0
+  amp: true              # mixed precision (économise la VRAM)
+  pretrain_steps: 200000
+  checkpoint_every: 2000
+  log_every: 50
+
+online:
+  lr: 0.0001             # LR faible -> limite l'oubli catastrophique
+  batch_size: 256
+  step_every_sec: 2.0    # cadence des pas de gradient
+  checkpoint_every_sec: 60
+  buffer_capacity: 500000  # taille du replay buffer glissant (samples)
+  min_buffer: 5000       # attendre ce nb de samples avant de s'entraîner
+
+data:
+  raw_dir: data/lichess_raw
+  buffer_dir: data/replay_buffer
+  shards_dir: data/shards
+  min_elo: 2000          # filtre qualité: Elo moyen minimum des parties
+  exclude_bullet: true   # ignorer le bullet (bruyant)
+  exclude_no_eval: false # garder même sans eval Stockfish
+
+paths:
+  checkpoint_dir: checkpoints
+  latest: checkpoints/latest.pt
+
+lichess:
+  # Token optionnel (var d'env LICHESS_TOKEN prioritaire). Respecter la ToS Lichess.
+  tv_channel: best       # flux TV utilisé par stream.py
+  request_timeout: 30
+
+bot:
+  accept_variants: [standard]   # variantes de défis acceptées
+  think_divisor: 40             # temps de réflexion ~ temps_restant / divisor
+  max_think_seconds: 10.0       # plafond de réflexion par coup

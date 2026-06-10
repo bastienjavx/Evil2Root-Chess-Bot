@@ -1,0 +1,271 @@
+"""Bot Lichess natif pour San-o1.
+
+Pilote directement le moteur MCTS (pas de pont UCI) via l'API Bot de Lichess :
+  - écoute les événements (/api/stream/event)
+  - accepte les défis (échecs standard)
+  - joue chaque partie en streamant son état et en postant ses coups
+
+Pré-requis :
+  - un token Lichess avec le scope `bot:play` (dans .env -> LICHESS_TOKEN)
+  - le compte doit être un COMPTE BOT (voir `--upgrade`, irréversible)
+
+Usage :
+  python -m sanchess.lichess_bot --check      # affiche l'état du compte (lecture seule)
+  python -m sanchess.lichess_bot --upgrade    # convertit le compte en BOT (IRRÉVERSIBLE)
+  python -m sanchess.lichess_bot              # lance le bot (boucle de jeu)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+
+import chess
+import requests
+import torch
+
+from .model import build_model
+from .search.mcts import MCTS, Evaluator, best_move
+from .utils import load_checkpoint, load_config, load_dotenv
+
+API = "https://lichess.org"
+
+
+def _parse_line(line):
+    """Parse une ligne ndjson Lichess. Retourne None pour les keep-alive (lignes
+    vides envoyées régulièrement par les streams) et toute ligne non-JSON."""
+    if not line:
+        return None
+    if isinstance(line, bytes):
+        line = line.decode("utf-8", "ignore")
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+
+class SearchEngine:
+    """Charge le réseau + MCTS, avec rechargement à chaud des poids."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        dev = cfg.get("train", {}).get("device", "cuda")
+        self.device = dev if (dev == "cpu" or torch.cuda.is_available()) else "cpu"
+        self.ckpt_path = Path(cfg["paths"]["latest"])
+        self._mtime = None
+        self.default_nodes = cfg.get("mcts", {}).get("default_nodes", 800)
+        self._build()
+
+    def _build(self):
+        model = build_model(self.cfg)
+        if self.ckpt_path.exists():
+            ck = load_checkpoint(self.ckpt_path, self.device)
+            model.load_state_dict(ck["model_state"])
+            self._mtime = self.ckpt_path.stat().st_mtime
+            sys.stderr.write(f"[engine] poids chargés (step {ck.get('step','?')})\n")
+        else:
+            sys.stderr.write("[engine] AUCUN checkpoint -> réseau aléatoire (jeu faible)\n")
+        self.mcts = MCTS(Evaluator(model, self.device), self.cfg)
+
+    def maybe_reload(self):
+        if self.ckpt_path.exists():
+            m = self.ckpt_path.stat().st_mtime
+            if m != self._mtime:
+                self._build()
+
+    def choose_move(self, board: chess.Board, think_seconds: float | None):
+        nodes = 10_000_000 if think_seconds else self.default_nodes
+        root = self.mcts.run(board, nodes, max_seconds=think_seconds)
+        return best_move(root)
+
+
+class LichessBot:
+    def __init__(self, cfg: dict, token: str):
+        self.cfg = cfg
+        self.engine = SearchEngine(cfg)
+        self.session = requests.Session()
+        self.session.headers.update({"Authorization": f"Bearer {token}"})
+        self.account = self._get("/api/account")
+        self.bot_id = self.account["id"]
+        bcfg = cfg.get("bot", {})
+        self.accept_variants = set(bcfg.get("accept_variants", ["standard"]))
+        self.think_divisor = bcfg.get("think_divisor", 40)
+        self.max_think = bcfg.get("max_think_seconds", 10.0)
+        self.active_games: set[str] = set()
+
+    # --- HTTP ---------------------------------------------------------------
+    def _get(self, path, **kw):
+        r = self.session.get(API + path, timeout=30, **kw)
+        r.raise_for_status()
+        return r.json()
+
+    def _post(self, path):
+        r = self.session.post(API + path, timeout=30)
+        return r
+
+    def _stream(self, path):
+        return self.session.get(API + path, stream=True, timeout=None)
+
+    # --- Boucle d'événements ------------------------------------------------
+    def run(self):
+        title = self.account.get("title")
+        print(f"Connecté : {self.account['username']} (title={title})")
+        if title != "BOT":
+            print("ATTENTION : ce compte n'est pas un BOT. Lance --upgrade d'abord.")
+            return
+        print("En écoute des défis… (envoie un défi à ce compte pour jouer)")
+        while True:
+            try:
+                resp = self._stream("/api/stream/event")
+                for line in resp.iter_lines():
+                    event = _parse_line(line)
+                    if event is None:
+                        continue
+                    self._handle_event(event)
+            except Exception as e:
+                print(f"[event] reconnexion ({e})")
+                time.sleep(3)
+
+    def _handle_event(self, event):
+        etype = event.get("type")
+        if etype == "challenge":
+            self._on_challenge(event["challenge"])
+        elif etype == "gameStart":
+            gid = event["game"]["id"]
+            if gid not in self.active_games:
+                self.active_games.add(gid)
+                threading.Thread(target=self._play_game, args=(gid,), daemon=True).start()
+
+    def _on_challenge(self, ch):
+        cid = ch["id"]
+        variant = ch.get("variant", {}).get("key", "standard")
+        if variant not in self.accept_variants:
+            self._post(f"/api/challenge/{cid}/decline")
+            print(f"[défi] {cid} décliné (variante {variant})")
+            return
+        r = self._post(f"/api/challenge/{cid}/accept")
+        if r.status_code == 200:
+            print(f"[défi] {cid} accepté ({ch.get('challenger',{}).get('name','?')})")
+        else:
+            print(f"[défi] échec acceptation {cid}: {r.status_code}")
+
+    # --- Partie -------------------------------------------------------------
+    def _play_game(self, game_id: str):
+        self.engine.maybe_reload()        # prend les derniers poids appris
+        print(f"[partie {game_id}] démarrée")
+        my_color = None
+        initial_fen = "startpos"
+        try:
+            resp = self._stream(f"/api/bot/game/stream/{game_id}")
+            for line in resp.iter_lines():
+                msg = _parse_line(line)
+                if msg is None:
+                    continue
+                t = msg.get("type")
+                if t == "gameFull":
+                    initial_fen = msg.get("initialFen", "startpos")
+                    my_color = (chess.WHITE if msg["white"].get("id") == self.bot_id
+                                else chess.BLACK)
+                    self._maybe_move(game_id, initial_fen, msg["state"], my_color)
+                elif t == "gameState":
+                    if msg.get("status") != "started":
+                        print(f"[partie {game_id}] terminée ({msg.get('status')})")
+                        break
+                    self._maybe_move(game_id, initial_fen, msg, my_color)
+        except Exception as e:
+            print(f"[partie {game_id}] erreur stream: {e}")
+        finally:
+            self.active_games.discard(game_id)
+
+    def _build_board(self, initial_fen: str, moves: str) -> chess.Board:
+        board = chess.Board() if initial_fen == "startpos" else chess.Board(initial_fen)
+        for mv in moves.split():
+            board.push_uci(mv)
+        return board
+
+    def _think_seconds(self, state, my_color) -> float | None:
+        key = "wtime" if my_color == chess.WHITE else "btime"
+        inc_key = "winc" if my_color == chess.WHITE else "binc"
+        remaining = state.get(key)
+        if remaining is None:                      # correspondance / sans pendule
+            return None
+        inc = state.get(inc_key, 0) / 1000.0
+        t = (remaining / 1000.0) / self.think_divisor + 0.8 * inc
+        return max(0.1, min(t, self.max_think))
+
+    def _maybe_move(self, game_id, initial_fen, state, my_color):
+        board = self._build_board(initial_fen, state.get("moves", ""))
+        if board.turn != my_color or board.is_game_over():
+            return
+        move = self.engine.choose_move(board, self._think_seconds(state, my_color))
+        if move is None:
+            return
+        r = self._post(f"/api/bot/game/{game_id}/move/{move.uci()}")
+        if r.status_code != 200:
+            print(f"[partie {game_id}] coup refusé {move.uci()}: {r.status_code} {r.text}")
+
+
+# --- Commandes ---------------------------------------------------------------
+def get_token() -> str:
+    load_dotenv()
+    token = os.environ.get("LICHESS_TOKEN")
+    if not token:
+        sys.exit("LICHESS_TOKEN absent (.env ou variable d'env). "
+                 "Crée un token avec le scope bot:play sur lichess.org/account/oauth/token")
+    return token
+
+
+def cmd_check(token):
+    r = requests.get(API + "/api/account",
+                     headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    r.raise_for_status()
+    acc = r.json()
+    title = acc.get("title")
+    nb_games = acc.get("count", {}).get("all", 0)
+    print(f"Compte    : {acc['username']}")
+    print(f"Titre     : {title or '(aucun)'}")
+    print(f"Parties   : {nb_games}")
+    if title == "BOT":
+        print("=> Déjà un compte BOT : prêt à lancer `python -m sanchess.lichess_bot`.")
+    elif nb_games == 0:
+        print("=> Compte vierge : éligible à --upgrade (conversion en BOT, IRRÉVERSIBLE).")
+    else:
+        print("=> NON éligible : ce compte a déjà joué. Crée un NOUVEAU compte pour le bot.")
+
+
+def cmd_upgrade(token):
+    r = requests.post(API + "/api/bot/account/upgrade",
+                      headers={"Authorization": f"Bearer {token}"}, timeout=30)
+    if r.status_code == 200:
+        print("OK : compte converti en BOT.")
+    else:
+        print(f"Échec upgrade : {r.status_code} {r.text}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--check", action="store_true", help="afficher l'état du compte (lecture seule)")
+    ap.add_argument("--upgrade", action="store_true", help="convertir en compte BOT (IRRÉVERSIBLE)")
+    ap.add_argument("--config", default=None)
+    args = ap.parse_args()
+
+    token = get_token()
+    if args.check:
+        cmd_check(token); return
+    if args.upgrade:
+        cmd_upgrade(token); return
+
+    cfg = load_config(args.config)
+    LichessBot(cfg, token).run()
+
+
+if __name__ == "__main__":
+    main()

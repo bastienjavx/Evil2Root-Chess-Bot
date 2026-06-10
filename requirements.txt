@@ -1,0 +1,15 @@
+# Coeur ML — installe PyTorch avec CUDA séparément si besoin :
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.2
+numpy>=1.26
+
+# Échecs
+python-chess>=1.999
+
+# Données Lichess
+zstandard>=0.22      # décompression des dumps .pgn.zst
+requests>=2.31       # API Lichess (stream temps réel)
+
+# Config / utilitaires
+pyyaml>=6.0
+tqdm>=4.66
