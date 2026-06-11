@@ -97,18 +97,23 @@ class SanChessNet(nn.Module):
     def __init__(self, channels: int = 128, blocks: int = 10,
                  se: bool = False, se_ratio: int = 4, value_hidden: int = 256,
                  policy_head: str = "flat", value_channels: int = 8,
-                 activation: str = "relu"):
+                 activation: str = "relu", value_head: str = "scalar"):
         super().__init__()
         if policy_head not in ("flat", "conv"):
             raise ValueError(f"policy_head inconnu: {policy_head!r} "
                              f"(choix: 'flat', 'conv')")
+        if value_head not in ("scalar", "wdl"):
+            raise ValueError(f"value_head inconnu: {value_head!r} "
+                             f"(choix: 'scalar', 'wdl')")
         self.cfg_meta = {"channels": channels, "blocks": blocks,
                          "se": se, "se_ratio": se_ratio,
                          "value_hidden": value_hidden,
                          "policy_head": policy_head,
                          "value_channels": value_channels,
-                         "activation": activation}
+                         "activation": activation,
+                         "value_head": value_head}
         self.policy_head = policy_head
+        self.value_head = value_head
         self.stem = nn.Sequential(
             nn.Conv2d(INPUT_PLANES, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
@@ -143,10 +148,12 @@ class SanChessNet(nn.Module):
             nn.BatchNorm2d(value_channels),
             _make_act(activation),
         )
+        # Tête scalaire -> 1 sortie (tanh) ; tête WDL -> 3 logits (défaite/nulle/victoire).
+        value_out = 3 if value_head == "wdl" else 1
         self.value_fc = nn.Sequential(
             nn.Linear(value_channels * 8 * 8, value_hidden),
             _make_act(activation),
-            nn.Linear(value_hidden, 1),
+            nn.Linear(value_hidden, value_out),
         )
         self._init_weights()
 
@@ -180,7 +187,10 @@ class SanChessNet(nn.Module):
             policy_logits = self.policy_fc(p)
 
         v = self.value_conv(x).flatten(1)
-        value = torch.tanh(self.value_fc(v))   # [-1, 1] du point de vue du trait
+        v = self.value_fc(v)
+        # Scalaire : tanh ∈ [-1,1] (point de vue du trait). WDL : 3 logits bruts
+        # (défaite/nulle/victoire) -> softmax + perte/scalaire gérés en aval.
+        value = v if self.value_head == "wdl" else torch.tanh(v)
 
         return policy_logits, value
 
@@ -197,6 +207,7 @@ def _model_kwargs(m: dict) -> dict:
         "policy_head": str(m.get("policy_head", "flat")),
         "value_channels": int(m.get("value_channels", 8)),
         "activation": str(m.get("activation", "relu")),
+        "value_head": str(m.get("value_head", "scalar")),
     }
 
 

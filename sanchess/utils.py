@@ -106,14 +106,29 @@ def load_checkpoint(path: str | os.PathLike, map_location="cpu") -> dict:
 def load_model_state(model, state: dict, strict: bool = False) -> None:
     """Charge des poids en tolérant les divergences d'architecture.
 
-    Utile pour le hot-reload entre versions du réseau (ex. ajout de blocs SE) :
-    on charge ce qui correspond et on signale ce qui manque plutôt que de planter.
+    Utile pour le hot-reload entre versions du réseau (ex. ajout de blocs SE) ou
+    le warm-start lors d'un changement de tête (ex. valeur scalar -> wdl) : on
+    charge ce qui correspond et on signale le reste plutôt que de planter.
+
+    Note : `strict=False` ignore les clés manquantes/en trop, mais PAS les tenseurs
+    présents de forme DIFFÉRENTE (PyTorch lève quand même). On filtre donc d'abord
+    les poids dont la forme ne correspond pas au modèle courant.
     """
+    own = model.state_dict()
+    mismatched = [k for k, v in state.items()
+                  if k in own and hasattr(v, "shape") and v.shape != own[k].shape]
+    if mismatched:
+        state = {k: v for k, v in state.items() if k not in mismatched}
     result = model.load_state_dict(state, strict=strict)
     missing = getattr(result, "missing_keys", [])
     unexpected = getattr(result, "unexpected_keys", [])
-    if missing or unexpected:
+    if missing or unexpected or mismatched:
         import sys
         sys.stderr.write(
             f"info string poids partiellement chargés "
-            f"(manquants={len(missing)}, inattendus={len(unexpected)})\n")
+            f"(manquants={len(missing)}, inattendus={len(unexpected)}, "
+            f"formes incompatibles={len(mismatched)})\n")
+    # Bilan : permet à l'appelant de savoir si l'architecture est IDENTIQUE
+    # (tout à 0) et donc s'il est sûr de réutiliser l'état de l'optimiseur.
+    return {"missing": len(missing), "unexpected": len(unexpected),
+            "mismatched": len(mismatched)}

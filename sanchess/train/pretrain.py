@@ -19,13 +19,13 @@ import time
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from ..model import build_model
 from ..utils import (amp_enabled, autocast_ctx, load_checkpoint, load_config,
                      load_model_state, resolve_device, save_checkpoint)
 from .dataset import ShardDataset, find_shards
+from .losses import policy_loss, value_loss
 
 
 def lr_at_step(step: int, base_lr: float, warmup: int, total: int,
@@ -121,12 +121,18 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
     step = 0
     if resume and latest.exists():
         ckpt = load_checkpoint(latest, map_location=device)
-        load_model_state(model, ckpt.get("raw_state", ckpt["model_state"]))
-        if "optimizer_state" in ckpt:
+        info = load_model_state(model, ckpt.get("raw_state", ckpt["model_state"]))
+        # Ne réutiliser l'optimiseur QUE si l'architecture est identique. Sinon
+        # (warm-start après changement de tête, ex. scalar -> wdl) ses moments ont
+        # des formes incompatibles et plantent au 1ᵉʳ step -> on repart à neuf.
+        arch_identical = info and not any(info.values())
+        if "optimizer_state" in ckpt and arch_identical:
             try:
                 opt.load_state_dict(ckpt["optimizer_state"])
             except (ValueError, KeyError):
                 print("État optimizer incompatible (archi modifiée) -> repart à neuf.")
+        elif not arch_identical:
+            print("Warm-start (archi modifiée) -> optimiseur réinitialisé.")
         step = int(ckpt.get("step", 0))
         if step >= max_steps:
             print(f"Reprise depuis {latest} : déjà {step} steps >= {max_steps} "
@@ -143,9 +149,9 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
     t0 = time.time()
     running_p = running_v = 0.0
     while step < max_steps:
-        for planes, target_idx, target_val in loader:
+        for planes, target_policy, target_val in loader:
             planes = planes.to(device, non_blocking=True)
-            target_idx = target_idx.to(device, non_blocking=True)
+            target_policy = target_policy.to(device, non_blocking=True)
             target_val = target_val.to(device, non_blocking=True)
 
             lr = lr_at_step(step, base_lr, warmup, max_steps, schedule)
@@ -155,9 +161,8 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
             opt.zero_grad(set_to_none=True)
             with autocast_ctx(device, use_amp):
                 logits, value = model(planes)
-                loss_p = F.cross_entropy(logits, target_idx,
-                                         label_smoothing=label_smooth)
-                loss_v = F.mse_loss(value.squeeze(1), target_val)
+                loss_p = policy_loss(logits, target_policy, label_smooth)
+                loss_v = value_loss(value, target_val)
                 loss = loss_p + vlw * loss_v
 
             scaler.scale(loss).backward()
