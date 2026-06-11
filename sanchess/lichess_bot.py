@@ -32,9 +32,9 @@ import chess
 import requests
 import torch
 
-from .model import build_model
+from .model import build_model, build_model_from_checkpoint
 from .search.mcts import MCTS, Evaluator, best_move
-from .utils import load_checkpoint, load_config, load_dotenv
+from .utils import load_checkpoint, load_config, load_dotenv, load_model_state
 
 API = "https://lichess.org"
 
@@ -71,13 +71,19 @@ class SearchEngine:
         self._build()
 
     def _build(self):
-        model = build_model(self.cfg)
         if self.ckpt_path.exists():
             ck = load_checkpoint(self.ckpt_path, self.device)
-            model.load_state_dict(ck["model_state"])
+            # Construire le réseau d'après l'ARCHI enregistrée dans le checkpoint
+            # (et non la config courante) : un latest.pt wdl se charge même si
+            # config.yaml dit `scalar`, et inversement -> plus de crash de forme
+            # quand config et checkpoint divergent. `load_model_state` reste
+            # tolérant (poids partiels) par-dessus.
+            model = build_model_from_checkpoint(ck, fallback_cfg=self.cfg)
+            load_model_state(model, ck["model_state"])
             self._mtime = self.ckpt_path.stat().st_mtime
             sys.stderr.write(f"[engine] poids chargés (step {ck.get('step','?')})\n")
         else:
+            model = build_model(self.cfg)
             sys.stderr.write("[engine] AUCUN checkpoint -> réseau aléatoire (jeu faible)\n")
         self.mcts = MCTS(Evaluator(model, self.device), self.cfg)
 
