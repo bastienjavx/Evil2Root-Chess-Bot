@@ -40,11 +40,11 @@ class Evaluator:
     def __init__(self, model, device: str = "cuda"):
         self.model = model.to(device).eval()
         self.device = device
-        # Le réseau est convolutif et les formes d'entrée sont quasi fixes
-        # (batch 1 à eval_batch_size) : laisser cuDNN choisir/cacher les meilleurs
-        # algos accélère les forwards d'inférence (gratuit, une fois warmé).
-        if str(device).startswith("cuda"):
-            torch.backends.cudnn.benchmark = True
+        # NB : on n'active PAS torch.backends.cudnn.benchmark. Les formes d'entrée
+        # NE sont PAS fixes (batch 1 à la racine, jusqu'à eval_batch_size, plus un
+        # dernier lot partiel de taille variable) -> cuDNN ré-autotune à chaque
+        # nouvelle forme, avec un pic de latence non interruptible par le deadline.
+        # En cadence rapide ça peut faire tomber le drapeau ; le gain est nul ici.
 
     @torch.no_grad()
     def evaluate(self, boards: list[chess.Board]):
