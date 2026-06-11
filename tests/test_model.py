@@ -17,18 +17,37 @@ from sanchess.utils import (amp_enabled, device_kind, load_model_state,
 def test_forward_shapes():
     """Sortie : politique (B, 4672) et valeur (B, 1) dans [-1, 1]."""
     for se in (False, True):
-        net = SanChessNet(channels=16, blocks=2, se=se).eval()
-        x = torch.randn(4, INPUT_PLANES, 8, 8)
-        with torch.no_grad():
-            logits, value = net(x)
-        assert logits.shape == (4, POLICY_SIZE), logits.shape
-        assert value.shape == (4, 1), value.shape
-        assert torch.all(value >= -1) and torch.all(value <= 1)
+        for policy_head, activation in (("flat", "relu"), ("conv", "mish")):
+            net = SanChessNet(channels=16, blocks=2, se=se,
+                              policy_head=policy_head,
+                              activation=activation).eval()
+            x = torch.randn(4, INPUT_PLANES, 8, 8)
+            with torch.no_grad():
+                logits, value = net(x)
+            assert logits.shape == (4, POLICY_SIZE), logits.shape
+            assert value.shape == (4, 1), value.shape
+            assert torch.all(value >= -1) and torch.all(value <= 1)
+
+
+def test_conv_policy_ordering():
+    """L'aplatissement de la tête conv suit l'ordre `from_sq * 73 + plane`
+    de encoding.move_to_index."""
+    from sanchess.encoding import PLANES_PER_SQUARE
+    from sanchess.model import _policy_planes_to_logits
+
+    p = torch.empty(1, PLANES_PER_SQUARE, 8, 8)
+    for plane in range(PLANES_PER_SQUARE):
+        for r in range(8):
+            for f in range(8):
+                p[0, plane, r, f] = (r * 8 + f) * PLANES_PER_SQUARE + plane
+    flat = _policy_planes_to_logits(p)
+    assert torch.equal(flat[0], torch.arange(POLICY_SIZE, dtype=p.dtype))
 
 
 def test_build_from_config_and_checkpoint():
     cfg = {"model": {"channels": 16, "blocks": 2, "se": True, "se_ratio": 2,
-                     "value_hidden": 32}}
+                     "value_hidden": 32, "policy_head": "conv",
+                     "value_channels": 16, "activation": "mish"}}
     net = build_model(cfg)
     ckpt = {"model_cfg": cfg["model"], "model_state": net.state_dict()}
     rebuilt = build_model_from_checkpoint(ckpt, {})
@@ -69,6 +88,7 @@ def test_flatten_roundtrip():
 
 if __name__ == "__main__":
     test_forward_shapes()
+    test_conv_policy_ordering()
     test_build_from_config_and_checkpoint()
     test_tolerant_load_across_architectures()
     test_resolve_device_and_helpers()
