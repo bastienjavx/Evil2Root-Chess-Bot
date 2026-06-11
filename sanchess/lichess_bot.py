@@ -430,13 +430,17 @@ class LichessBot:
         # En correspondance, Lichess ferme les flux inactifs après une longue
         # attente : on se reconnecte tant que la partie n'est pas terminée, sinon
         # le bot « oublie » la partie et ne rejoue jamais.
+        backoff = 2.0          # délai de reconnexion (croît si Lichess refuse)
+        consec_empty = 0       # reconnexions sans aucune donnée reçue
         while not game_over:
+            got_data = False
             try:
                 resp = self._stream(f"/api/bot/game/stream/{game_id}")
                 for line in resp.iter_lines():
                     msg = _parse_line(line)
                     if msg is None:
                         continue
+                    got_data = True
                     t = msg.get("type")
                     if t == "chatLine":
                         self._on_chat(g, msg)
@@ -461,10 +465,37 @@ class LichessBot:
                     self._maybe_move(g, state)
             except Exception as e:
                 print(f"[partie {game_id}] erreur stream: {e}")
-            if not game_over:
-                print(f"[partie {game_id}] flux interrompu, reconnexion…")
-                time.sleep(2)
+            if game_over:
+                break
+            # Le flux s'est interrompu sans état terminal. Avant de boucler à
+            # l'infini, on demande à Lichess si la partie est encore en cours :
+            # une partie finie/avortée n'apparaît plus dans /api/account/playing
+            # et Lichess ferme alors son flux « without response ».
+            if not self._game_in_progress(game_id):
+                print(f"[partie {game_id}] absente des parties en cours → suivi abandonné")
+                break
+            if got_data:
+                backoff, consec_empty = 2.0, 0
+            else:
+                consec_empty += 1
+                if consec_empty >= 5:
+                    print(f"[partie {game_id}] flux injoignable ({consec_empty} essais vides) "
+                          f"→ suivi abandonné")
+                    break
+            print(f"[partie {game_id}] flux interrompu, reconnexion dans {backoff:.0f}s…")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
         self.games.pop(game_id, None)
+
+    def _game_in_progress(self, game_id: str) -> bool:
+        """Vrai si Lichess liste encore la partie dans /api/account/playing.
+        En cas d'erreur réseau on renvoie True : on ne veut pas abandonner une
+        vraie partie en cours à cause d'un simple hoquet de connexion."""
+        try:
+            playing = self._get("/api/account/playing").get("nowPlaying", [])
+            return any(p.get("gameId") == game_id for p in playing)
+        except Exception:
+            return True
 
     def _greet(self, g: _Game):
         if g.greeted or not self.chat_enabled:
