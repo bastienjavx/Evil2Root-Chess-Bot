@@ -30,9 +30,11 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
     shards = find_shards(shards_dir or cfg["data"]["shards_dir"])
     if not shards:
         raise SystemExit("Aucun shard. Lance d'abord pgn_to_samples.")
-    print(f"{len(shards)} shards trouvés. Chargement…")
-    ds = ShardDataset(shards)
-    print(f"{len(ds)} samples.")
+    max_samples = cfg["data"].get("max_train_samples")
+    cap_txt = f" (plafond {max_samples} samples)" if max_samples else ""
+    print(f"{len(shards)} shards trouvés. Chargement{cap_txt}…")
+    ds = ShardDataset(shards, max_samples=max_samples)
+    print(f"{len(ds)} samples chargés.")
 
     loader = DataLoader(ds, batch_size=tcfg["batch_size"], shuffle=True,
                         num_workers=4, pin_memory=(device == "cuda"),

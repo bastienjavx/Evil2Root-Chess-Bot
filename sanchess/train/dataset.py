@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
 import chess
@@ -18,12 +19,25 @@ def find_shards(shards_dir: str | Path) -> list[Path]:
 
 
 class ShardDataset(Dataset):
-    """Charge les lignes (fen, move, value) en mémoire ; encode dans __getitem__."""
+    """Charge les lignes (fen, move, value) en mémoire ; encode dans __getitem__.
 
-    def __init__(self, shard_paths: list[Path]):
+    Garde-fou OOM : si `max_samples` est fixé, on s'arrête une fois ce nombre de
+    samples atteint. Les shards sont d'abord mélangés (graine fixe = reproductible)
+    pour obtenir un échantillon représentatif de TOUS les mois, et pas seulement
+    des premiers shards (sinon on ne verrait que les mois les plus récents).
+    """
+
+    def __init__(self, shard_paths: list[Path],
+                 max_samples: int | None = None, seed: int = 0):
+        paths = list(shard_paths)
+        if max_samples:
+            random.Random(seed).shuffle(paths)
         self.rows: list[tuple[str, str, int]] = []
-        for p in shard_paths:
+        for p in paths:
             self.rows.extend(iter_samples(p))
+            if max_samples and len(self.rows) >= max_samples:
+                del self.rows[max_samples:]
+                break
         if not self.rows:
             raise RuntimeError("Aucun sample trouvé dans les shards fournis.")
 

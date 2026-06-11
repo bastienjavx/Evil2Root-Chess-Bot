@@ -40,6 +40,11 @@ data:
   min_elo: 2000          # filtre qualité: Elo moyen minimum des parties
   exclude_bullet: true   # ignorer le bullet (bruyant)
   exclude_no_eval: false # garder même sans eval Stockfish
+  # Garde-fou OOM : plafond de samples chargés en RAM par le pretrain (les shards
+  # sont mélangés avant troncature -> échantillon représentatif de tous les mois).
+  # ~217 o/sample => 100 M ≈ 22 Go. Mettre null pour tout charger (risque OOM si
+  # le dataset dépasse la RAM). Augmenter prudemment selon `free -h`.
+  max_train_samples: 100000000
 
 paths:
   checkpoint_dir: checkpoints
@@ -54,3 +59,11 @@ bot:
   accept_variants: [standard]   # variantes de défis acceptées
   think_divisor: 40             # temps de réflexion ~ temps_restant / divisor
   max_think_seconds: 10.0       # plafond de réflexion par coup
+  # Défi automatique d'autres bots Lichess (pour jouer/s'entraîner en continu)
+  challenge_bots: true          # active l'envoi périodique de défis à d'autres bots
+  challenge_interval_sec: 60    # fréquence de tentative d'envoi
+  challenge_cooldown_sec: 600   # délai mini avant de re-défier le même bot
+  max_concurrent_games: 1       # ne défie pas si déjà ce nb de parties en cours
+  challenge_clock_limit: 300    # cadence: secondes de base (300 = 5 min)
+  challenge_clock_increment: 3  # incrément par coup (s)
+  challenge_rated: false        # false = parties amicales (n'affecte pas l'Elo)

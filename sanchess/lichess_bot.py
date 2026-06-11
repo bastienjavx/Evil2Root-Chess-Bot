@@ -21,6 +21,7 @@ import argparse
 import fcntl
 import json
 import os
+import random
 import sys
 import tempfile
 import threading
@@ -117,6 +118,9 @@ class LichessBot:
         self.think_divisor = bcfg.get("think_divisor", 40)
         self.max_think = bcfg.get("max_think_seconds", 10.0)
         self.active_games: set[str] = set()
+        # Défi automatique d'autres bots (cooldown par adversaire pour ne pas spammer).
+        self.challenge_bots = bool(bcfg.get("challenge_bots", False))
+        self._recent_challenges: dict[str, float] = {}
 
     # --- HTTP ---------------------------------------------------------------
     def _get(self, path, **kw):
@@ -132,8 +136,8 @@ class LichessBot:
                 print(f"[connexion] Lichess injoignable ({e}); nouvel essai dans {delay:.0f}s")
                 time.sleep(delay)
 
-    def _post(self, path):
-        r = self.session.post(API + path, timeout=30)
+    def _post(self, path, data=None):
+        r = self.session.post(API + path, data=data, timeout=30)
         return r
 
     def _stream(self, path):
@@ -147,6 +151,8 @@ class LichessBot:
             print("ATTENTION : ce compte n'est pas un BOT. Lance --upgrade d'abord.")
             return
         print("En écoute des défis… (envoie un défi à ce compte pour jouer)")
+        if self.challenge_bots:
+            threading.Thread(target=self._challenge_loop, daemon=True).start()
         # Reprend les parties déjà en cours (essentiel en correspondance : le bot
         # peut avoir été relancé alors qu'une partie attend son coup).
         try:
@@ -181,6 +187,9 @@ class LichessBot:
 
     def _on_challenge(self, ch):
         cid = ch["id"]
+        # Défi sortant créé par nous-mêmes (relayé sur le flux d'events) : rien à faire.
+        if ch.get("challenger", {}).get("id") == self.bot_id:
+            return
         variant = ch.get("variant", {}).get("key", "standard")
         if variant not in self.accept_variants:
             self._post(f"/api/challenge/{cid}/decline")
@@ -191,6 +200,60 @@ class LichessBot:
             print(f"[défi] {cid} accepté ({ch.get('challenger',{}).get('name','?')})")
         else:
             print(f"[défi] échec acceptation {cid}: {r.status_code}")
+
+    # --- Défi automatique d'autres bots -------------------------------------
+    def _online_bots(self, nb: int = 50) -> list[str]:
+        """Identifiants des bots actuellement en ligne (/api/bot/online, ndjson)."""
+        ids: list[str] = []
+        resp = self._stream(f"/api/bot/online?nb={nb}")
+        try:
+            for line in resp.iter_lines():
+                u = _parse_line(line)
+                if u and u.get("id"):
+                    ids.append(u["id"])
+        finally:
+            resp.close()
+        return ids
+
+    def _send_challenge(self, username: str, bcfg: dict):
+        data = {
+            "rated": "true" if bcfg.get("challenge_rated", False) else "false",
+            "clock.limit": bcfg.get("challenge_clock_limit", 300),
+            "clock.increment": bcfg.get("challenge_clock_increment", 3),
+            "color": "random",
+            "variant": "standard",
+        }
+        r = self._post(f"/api/challenge/{username}", data=data)
+        if r.status_code == 200:
+            print(f"[défi-bot] défi envoyé à {username}")
+        else:
+            print(f"[défi-bot] échec défi {username}: {r.status_code} {r.text[:120]}")
+
+    def _challenge_loop(self):
+        """Défie périodiquement un bot en ligne tant qu'on est sous le quota de
+        parties simultanées. Cooldown par adversaire pour ne pas spammer."""
+        bcfg = self.cfg.get("bot", {})
+        interval = bcfg.get("challenge_interval_sec", 60)
+        cooldown = bcfg.get("challenge_cooldown_sec", 600)
+        max_games = bcfg.get("max_concurrent_games", 1)
+        print(f"[défi-bot] activé : défie un bot en ligne toutes les {interval}s "
+              f"si < {max_games} partie(s) en cours.")
+        while True:
+            time.sleep(interval)
+            try:
+                if len(self.active_games) >= max_games:
+                    continue
+                now = time.time()
+                candidates = [b for b in self._online_bots()
+                              if b != self.bot_id
+                              and now - self._recent_challenges.get(b, 0) >= cooldown]
+                if not candidates:
+                    continue
+                opp = random.choice(candidates)
+                self._recent_challenges[opp] = now
+                self._send_challenge(opp, bcfg)
+            except Exception as e:  # noqa: BLE001 — le thread ne doit jamais mourir
+                print(f"[défi-bot] erreur: {e}")
 
     # --- Partie -------------------------------------------------------------
     def _play_game(self, game_id: str):
