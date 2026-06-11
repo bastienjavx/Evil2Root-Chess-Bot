@@ -1,7 +1,8 @@
-"""Chargement de config et gestion des checkpoints."""
+"""Chargement de config, sélection d'appareil et gestion des checkpoints."""
 
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
@@ -9,6 +10,56 @@ import torch
 import yaml
 
 _DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "config.yaml"
+
+
+# --- Sélection d'appareil (CUDA / MPS Apple Silicon / CPU) --------------------
+
+def _mps_available() -> bool:
+    backend = getattr(torch.backends, "mps", None)
+    return bool(backend is not None and backend.is_available())
+
+
+def resolve_device(requested: str | None = None) -> str:
+    """Résout l'appareil à utiliser.
+
+    "auto" (ou None) -> CUDA si dispo, sinon MPS (Mac M1/M2/M3), sinon CPU.
+    Une valeur explicite ("cuda"/"mps"/"cpu") est respectée si possible, avec
+    repli automatique vers CPU si l'accélérateur demandé est indisponible.
+    """
+    req = (requested or "auto").lower()
+    if req in ("auto", ""):
+        if torch.cuda.is_available():
+            return "cuda"
+        if _mps_available():
+            return "mps"
+        return "cpu"
+    if req == "cuda":
+        return "cuda" if torch.cuda.is_available() else ("mps" if _mps_available() else "cpu")
+    if req == "mps":
+        return "mps" if _mps_available() else "cpu"
+    return "cpu"
+
+
+def device_kind(device: str) -> str:
+    """Famille de l'appareil ('cuda', 'mps' ou 'cpu') à partir d'un id Torch."""
+    d = str(device)
+    if d.startswith("cuda"):
+        return "cuda"
+    if d.startswith("mps"):
+        return "mps"
+    return "cpu"
+
+
+def amp_enabled(device: str, want_amp: bool = True) -> bool:
+    """L'AMP (mixed precision) n'est fiable/utile que sur CUDA ici."""
+    return bool(want_amp) and device_kind(device) == "cuda"
+
+
+def autocast_ctx(device: str, enabled: bool):
+    """Contexte autocast adapté à l'appareil (no-op si désactivé)."""
+    if not enabled:
+        return contextlib.nullcontext()
+    return torch.autocast(device_type=device_kind(device), enabled=True)
 
 
 def load_dotenv(path: str | os.PathLike | None = None) -> None:
@@ -50,3 +101,19 @@ def save_checkpoint(path: str | os.PathLike, model, cfg: dict,
 
 def load_checkpoint(path: str | os.PathLike, map_location="cpu") -> dict:
     return torch.load(path, map_location=map_location, weights_only=False)
+
+
+def load_model_state(model, state: dict, strict: bool = False) -> None:
+    """Charge des poids en tolérant les divergences d'architecture.
+
+    Utile pour le hot-reload entre versions du réseau (ex. ajout de blocs SE) :
+    on charge ce qui correspond et on signale ce qui manque plutôt que de planter.
+    """
+    result = model.load_state_dict(state, strict=strict)
+    missing = getattr(result, "missing_keys", [])
+    unexpected = getattr(result, "unexpected_keys", [])
+    if missing or unexpected:
+        import sys
+        sys.stderr.write(
+            f"info string poids partiellement chargés "
+            f"(manquants={len(missing)}, inattendus={len(unexpected)})\n")

@@ -23,7 +23,8 @@ import torch.nn.functional as F
 from ..data.samples import iter_samples
 from ..encoding import encode_board, move_to_index
 from ..model import build_model
-from ..utils import load_checkpoint, load_config, save_checkpoint
+from ..utils import (load_checkpoint, load_config, load_model_state,
+                     resolve_device, save_checkpoint)
 
 
 def _encode_batch(rows, device):
@@ -53,14 +54,14 @@ def _ingest_new_shards(buffer_dir: Path, processed: set, buf: deque) -> int:
 
 def run(cfg: dict, seed_shards: str | None):
     ocfg = cfg["online"]
-    device = cfg["train"].get("device", "cuda")
-    if device == "cuda" and not torch.cuda.is_available():
-        print("CUDA indisponible -> CPU"); device = "cpu"
+    device = resolve_device(cfg["train"].get("device", "auto"))
+    print(f"Appareil : {device}")
 
     model = build_model(cfg).to(device)
     latest = Path(cfg["paths"]["latest"])
     if latest.exists():
-        model.load_state_dict(load_checkpoint(latest, device)["model_state"])
+        ck = load_checkpoint(latest, device)
+        load_model_state(model, ck.get("raw_state", ck["model_state"]))
         print(f"Repris depuis {latest}")
     else:
         print("Pas de checkpoint : démarrage à froid (idéalement pré-entraîner d'abord).")
