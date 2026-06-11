@@ -105,7 +105,10 @@ lichess:
 bot:
   accept_variants: [standard]   # variantes de défis acceptées
   think_divisor: 40             # temps de réflexion ~ temps_restant / divisor
-  max_think_seconds: 10.0       # plafond de réflexion par coup
+  max_think_seconds: 5.0        # plafond de réflexion par coup. MCTS ~6x plus
+                                # rapide depuis le fix du batching GPU -> 5 s donnent
+                                # déjà ~7000 nœuds. Baisser encore (ex. 2-3) pour des
+                                # coups plus rapides au prix d'un peu de force.
   # Défi automatique d'autres bots Lichess (pour jouer/s'entraîner en continu)
   challenge_bots: true           # active l'envoi périodique de défis à d'autres bots
   challenge_interval_sec: 60     # fréquence de tentative d'envoi

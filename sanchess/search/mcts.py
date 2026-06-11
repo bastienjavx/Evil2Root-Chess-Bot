@@ -18,17 +18,19 @@ from ..encoding import encode_board, move_to_index
 
 
 class _Node:
-    __slots__ = ("prior", "N", "W", "children", "expanded", "terminal")
+    __slots__ = ("prior", "N", "W", "vloss", "children", "expanded", "terminal")
 
     def __init__(self, prior: float):
         self.prior = prior
         self.N = 0
         self.W = 0.0
+        self.vloss = 0            # pertes virtuelles en vol (batch GPU), hors stats
         self.children: dict[chess.Move, _Node] = {}
         self.expanded = False
         self.terminal = False
 
     def q(self) -> float:
+        # Q « propre » (sans pertes virtuelles) : sert au FPU et aux stats finales.
         return self.W / self.N if self.N > 0 else 0.0
 
 
@@ -38,6 +40,11 @@ class Evaluator:
     def __init__(self, model, device: str = "cuda"):
         self.model = model.to(device).eval()
         self.device = device
+        # Le réseau est convolutif et les formes d'entrée sont quasi fixes
+        # (batch 1 à eval_batch_size) : laisser cuDNN choisir/cacher les meilleurs
+        # algos accélère les forwards d'inférence (gratuit, une fois warmé).
+        if str(device).startswith("cuda"):
+            torch.backends.cudnn.benchmark = True
 
     @torch.no_grad()
     def evaluate(self, boards: list[chess.Board]):
@@ -95,12 +102,24 @@ class MCTS:
 
     # --- Sélection PUCT -------------------------------------------------------
     def _select_child(self, node: _Node) -> tuple[chess.Move, _Node]:
-        sqrt_n = math.sqrt(node.N) if node.N > 0 else 1.0
+        total = node.N + node.vloss
+        sqrt_n = math.sqrt(total) if total > 0 else 1.0
+        # FPU : un fils non encore visité vaut ~ la valeur du parent (côté parent =
+        # node.q()) diminuée de `fpu`. Base PROPRE (sans pertes virtuelles) pour ne
+        # pas biaiser l'exploration quand un chemin est en vol dans le lot GPU.
+        fpu_base = node.q() - self.fpu
         best_score, best = -1e9, None
         for move, child in node.children.items():
-            # Q du point de vue du parent = -Q(fils) ; FPU pour fils non visité.
-            q = -child.q() if child.N > 0 else -node.q() - self.fpu
-            u = self.c_puct * child.prior * sqrt_n / (1 + child.N)
+            n_eff = child.N + child.vloss
+            if n_eff > 0:
+                # Q du point de vue du parent = -Q(fils). Chaque perte virtuelle
+                # compte comme une victoire du fils (donc une perte vue du parent)
+                # -> décourage de re-descendre le même chemin, ce qui REMPLIT le lot
+                # GPU (sinon le batch se vide à 1 feuille et la recherche rampe).
+                q = -(child.W + child.vloss) / n_eff
+            else:
+                q = fpu_base
+            u = self.c_puct * child.prior * sqrt_n / (1 + n_eff)
             score = q + u
             if score > best_score:
                 best_score, best = score, (move, child)
@@ -185,14 +204,12 @@ class MCTS:
     @staticmethod
     def _apply_virtual_loss(path: list[_Node]):
         for node in path:
-            node.N += 1
-            node.W += -1.0
+            node.vloss += 1
 
     @staticmethod
     def _revert_virtual_loss(path: list[_Node]):
         for node in path:
-            node.N -= 1
-            node.W += 1.0
+            node.vloss -= 1
 
 
 def best_move(root: _Node) -> chess.Move | None:
