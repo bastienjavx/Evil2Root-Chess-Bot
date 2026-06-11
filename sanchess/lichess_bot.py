@@ -210,6 +210,7 @@ class LichessBot:
         self.games: dict[str, _Game] = {}
         # Défi automatique d'autres bots (cooldown par adversaire pour ne pas spammer).
         self.challenge_bots = bool(bcfg.get("challenge_bots", False))
+        self.challenge_modes = self._build_challenge_modes(bcfg)
         self._recent_challenges: dict[str, float] = {}
         # --- Chat & courtoisie -------------------------------------------------
         self.chat_enabled = bool(bcfg.get("chat_enabled", True))
@@ -347,36 +348,61 @@ class LichessBot:
             resp.close()
         return ids
 
-    def _send_challenge(self, username: str, bcfg: dict):
+    def _build_challenge_modes(self, bcfg: dict) -> list[dict]:
+        """Liste des cadences proposées aux autres bots (tirage aléatoire par défi).
+
+        Chaque mode est un dict :
+          - temps-réel : {clock_limit: secondes, clock_increment: secondes}
+          - correspondance : {days: jours_par_coup}
+          - `rated` optionnel par mode (sinon valeur globale `challenge_rated`).
+        Si `bot.challenge_modes` est absent du config, on retombe sur l'ancien
+        réglage unique (`challenge_correspondence`/`challenge_clock_*`)."""
+        modes = bcfg.get("challenge_modes")
+        if modes:
+            return [m for m in modes if isinstance(m, dict)]
+        if bcfg.get("challenge_correspondence", False):
+            return [{"days": bcfg.get("challenge_days", 3)}]
+        return [{"clock_limit": bcfg.get("challenge_clock_limit", 300),
+                 "clock_increment": bcfg.get("challenge_clock_increment", 3)}]
+
+    def _send_challenge(self, username: str, mode: dict):
+        bcfg = self.cfg.get("bot", {})
+        rated = bool(mode.get("rated", bcfg.get("challenge_rated", False)))
         data = {
-            "rated": "true" if bcfg.get("challenge_rated", False) else "false",
+            "rated": "true" if rated else "false",
             "color": "random",
             "variant": "standard",
         }
-        if bcfg.get("challenge_correspondence", False):
+        if mode.get("days"):
             # Correspondance : délai en jours par coup, pas de pendule temps-réel.
-            data["days"] = bcfg.get("challenge_days", 3)
-            kind = f"correspondance {data['days']}j/coup"
+            data["days"] = mode["days"]
+            kind = f"correspondance {mode['days']}j/coup"
         else:
-            data["clock.limit"] = bcfg.get("challenge_clock_limit", 300)
-            data["clock.increment"] = bcfg.get("challenge_clock_increment", 3)
-            kind = f"{data['clock.limit']}+{data['clock.increment']}"
-        rated = "rated" if data["rated"] == "true" else "casual"
+            lim = int(mode.get("clock_limit", 600))
+            inc = int(mode.get("clock_increment", 5))
+            data["clock.limit"] = lim
+            data["clock.increment"] = inc
+            # Affichage type Lichess : minutes+incrément (300+3 -> "5+3").
+            mins = lim / 60
+            mins = int(mins) if mins == int(mins) else round(mins, 1)
+            kind = f"{mins}+{inc}"
         r = self._post(f"/api/challenge/{username}", data=data)
+        label = "rated" if rated else "casual"
         if r.status_code == 200:
-            print(f"[défi-bot] défi envoyé à {username} ({kind}, {rated})")
+            print(f"[défi-bot] défi envoyé à {username} ({kind}, {label})")
         else:
             print(f"[défi-bot] échec défi {username}: {r.status_code} {r.text[:120]}")
 
     def _challenge_loop(self):
         """Défie périodiquement un bot en ligne tant qu'on est sous le quota de
-        parties simultanées. Cooldown par adversaire pour ne pas spammer."""
+        parties simultanées. Cooldown par adversaire pour ne pas spammer. La
+        cadence est tirée au hasard parmi `self.challenge_modes` à chaque défi."""
         bcfg = self.cfg.get("bot", {})
         interval = bcfg.get("challenge_interval_sec", 60)
         cooldown = bcfg.get("challenge_cooldown_sec", 600)
         max_games = bcfg.get("max_concurrent_games", 1)
         print(f"[défi-bot] activé : défie un bot en ligne toutes les {interval}s "
-              f"si < {max_games} partie(s) en cours.")
+              f"si < {max_games} partie(s) en cours. {len(self.challenge_modes)} cadence(s).")
         while True:
             time.sleep(interval)
             try:
@@ -390,7 +416,7 @@ class LichessBot:
                     continue
                 opp = random.choice(candidates)
                 self._recent_challenges[opp] = now
-                self._send_challenge(opp, bcfg)
+                self._send_challenge(opp, random.choice(self.challenge_modes))
             except Exception as e:  # noqa: BLE001 — le thread ne doit jamais mourir
                 print(f"[défi-bot] erreur: {e}")
 

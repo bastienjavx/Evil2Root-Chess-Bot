@@ -110,12 +110,23 @@ bot:
   challenge_bots: true           # active l'envoi périodique de défis à d'autres bots
   challenge_interval_sec: 60     # fréquence de tentative d'envoi
   challenge_cooldown_sec: 600    # délai mini avant de re-défier le même bot
-  max_concurrent_games: 10       # correspondance = parties lentes -> plusieurs en parallèle
+  max_concurrent_games: 4        # plafond de parties simultanées (temps-réel : éviter le flag)
+  challenge_rated: true          # parties CLASSÉES par défaut (surchargeable par mode)
+  # Cadences proposées aux autres bots : UNE est tirée au hasard à chaque défi.
+  # -> évite le tout-correspondance, varie blitz lent / rapide / classique / corr.
+  # clock_limit ET clock_increment en SECONDES ; days = correspondance (sans pendule).
+  # `rated` est optionnel par mode (sinon = challenge_rated). Pas de bullet (trop rapide).
+  challenge_modes:
+    - { clock_limit: 300,  clock_increment: 3 }    # blitz 5+3
+    - { clock_limit: 600,  clock_increment: 5 }    # rapide 10+5
+    - { clock_limit: 900,  clock_increment: 10 }   # rapide 15+10
+    - { clock_limit: 1800, clock_increment: 20 }   # classique 30+20
+    - { days: 3 }                                  # correspondance 3j/coup
+  # --- Repli si challenge_modes est absent/vide (ancien réglage unique) ---------
   challenge_correspondence: true # défis en CORRESPONDANCE (par jours, sans pendule)
   challenge_days: 3              # jours par coup (valeurs Lichess: 1,2,3,5,7,10,14)
   challenge_clock_limit: 300     # (ignoré quand challenge_correspondence: true)
   challenge_clock_increment: 3   # (ignoré quand challenge_correspondence: true)
-  challenge_rated: true          # parties CLASSÉES (affecte l'Elo)
   # Chat dans la partie : salutations + commandes (!help, !eval, !pv, !top, !info, !rating, !fen…)
   chat_enabled: true             # répond aux commandes et salue au début/à la fin
   greeting: "Bonjour {opp} ! Je suis un réseau de neurones maison. Bonne partie — tape !help pour les commandes."
