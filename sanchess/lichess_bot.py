@@ -218,14 +218,21 @@ class LichessBot:
     def _send_challenge(self, username: str, bcfg: dict):
         data = {
             "rated": "true" if bcfg.get("challenge_rated", False) else "false",
-            "clock.limit": bcfg.get("challenge_clock_limit", 300),
-            "clock.increment": bcfg.get("challenge_clock_increment", 3),
             "color": "random",
             "variant": "standard",
         }
+        if bcfg.get("challenge_correspondence", False):
+            # Correspondance : délai en jours par coup, pas de pendule temps-réel.
+            data["days"] = bcfg.get("challenge_days", 3)
+            kind = f"correspondance {data['days']}j/coup"
+        else:
+            data["clock.limit"] = bcfg.get("challenge_clock_limit", 300)
+            data["clock.increment"] = bcfg.get("challenge_clock_increment", 3)
+            kind = f"{data['clock.limit']}+{data['clock.increment']}"
+        rated = "rated" if data["rated"] == "true" else "casual"
         r = self._post(f"/api/challenge/{username}", data=data)
         if r.status_code == 200:
-            print(f"[défi-bot] défi envoyé à {username}")
+            print(f"[défi-bot] défi envoyé à {username} ({kind}, {rated})")
         else:
             print(f"[défi-bot] échec défi {username}: {r.status_code} {r.text[:120]}")
 

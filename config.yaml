@@ -60,10 +60,12 @@ bot:
   think_divisor: 40             # temps de réflexion ~ temps_restant / divisor
   max_think_seconds: 10.0       # plafond de réflexion par coup
   # Défi automatique d'autres bots Lichess (pour jouer/s'entraîner en continu)
-  challenge_bots: true          # active l'envoi périodique de défis à d'autres bots
-  challenge_interval_sec: 60    # fréquence de tentative d'envoi
-  challenge_cooldown_sec: 600   # délai mini avant de re-défier le même bot
-  max_concurrent_games: 1       # ne défie pas si déjà ce nb de parties en cours
-  challenge_clock_limit: 300    # cadence: secondes de base (300 = 5 min)
-  challenge_clock_increment: 3  # incrément par coup (s)
-  challenge_rated: false        # false = parties amicales (n'affecte pas l'Elo)
+  challenge_bots: true           # active l'envoi périodique de défis à d'autres bots
+  challenge_interval_sec: 60     # fréquence de tentative d'envoi
+  challenge_cooldown_sec: 600    # délai mini avant de re-défier le même bot
+  max_concurrent_games: 10       # correspondance = parties lentes -> plusieurs en parallèle
+  challenge_correspondence: true # défis en CORRESPONDANCE (par jours, sans pendule)
+  challenge_days: 3              # jours par coup (valeurs Lichess: 1,2,3,5,7,10,14)
+  challenge_clock_limit: 300     # (ignoré quand challenge_correspondence: true)
+  challenge_clock_increment: 3   # (ignoré quand challenge_correspondence: true)
+  challenge_rated: true          # parties CLASSÉES (affecte l'Elo)
