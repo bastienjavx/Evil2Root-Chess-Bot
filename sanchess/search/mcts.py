@@ -44,8 +44,9 @@ class Evaluator:
         """Retourne une liste de (priors {move: prob}, value [-1,1] côté trait)."""
         x = np.stack([encode_board(b) for b in boards])
         t = torch.from_numpy(x).to(self.device)
-        with torch.autocast(device_type="cuda" if "cuda" in self.device else "cpu",
-                            enabled="cuda" in self.device):
+        use_cuda = str(self.device).startswith("cuda")
+        with torch.autocast(device_type="cuda" if use_cuda else "cpu",
+                            enabled=use_cuda):
             logits, values = self.model(t)
         logits = logits.float().cpu().numpy()
         values = values.float().cpu().numpy().reshape(-1)

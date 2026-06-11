@@ -53,14 +53,17 @@ Two ways to play it:
 
 ## Features
 
-- 🧠 **ResNet policy + value network** (configurable, default **20×256 ≈ 33M params**).
+- 🧠 **ResNet policy + value network** with **Squeeze-Excitation** blocks (configurable, default **20×256 + SE**).
 - 🌲 **PUCT MCTS** with batched GPU leaf evaluation, virtual loss, and Dirichlet root noise (self-play).
 - 📚 **Supervised pre-training** on Lichess monthly dumps — streamed and decompressed on the fly (no 30 GB download).
 - 🔄 **Continuous online learning** from live Lichess games, with a sliding replay buffer to limit catastrophic forgetting.
+- 🌐 **Distributed training across machines** — data-parallel over **Mac M1 (MPS) + Linux (CUDA/CPU)** via gloo all-reduce.
+- 🎯 **Modern training recipe** — LR warmup + cosine schedule, gradient clipping, label smoothing, optional weight EMA.
 - ♻️ **Hot-reload** — the engine picks up newly trained weights at the start of each game.
 - 🔌 **UCI protocol** + 🤖 **native Lichess bot** (challenge handling, clock-aware time management).
-- 🧪 Unit-tested move ↔ index encoding (round-trip verified over thousands of positions).
-- ⚡ Mixed-precision training (AMP) — the default network uses ~1.3 GB VRAM at batch 512.
+- 🍎 **Multi-accelerator** — automatic device selection (CUDA → Apple Silicon MPS → CPU).
+- 🧪 Unit-tested move ↔ index encoding and network forward pass.
+- ⚡ Mixed-precision training (AMP) on CUDA — the default network uses ~1.3 GB VRAM at batch 512.
 
 ## How it works
 
@@ -175,7 +178,8 @@ sanchess/
 │   └── samples.py         shared sample format (gzip text)
 └── train/
     ├── dataset.py         PyTorch dataset (on-the-fly encoding)
-    ├── pretrain.py        supervised pre-training (AMP)
+    ├── pretrain.py        supervised pre-training (AMP, LR schedule, EMA)
+    ├── distributed.py     multi-machine data-parallel trainer (Mac M1 + Linux)
     └── online.py          continuous learning + hot-reload checkpoints
 scripts/                   one-command launchers
 tests/                     encoding round-trip tests
@@ -206,6 +210,45 @@ All knobs live in [`config.yaml`](config.yaml):
 To avoid two trainers fighting over `latest.pt`, run online learning **after** pre-training
 finishes (see `scripts/online_after_pretrain.sh`).
 
+## Distributed training (Mac M1 + Linux)
+
+Train the same network across several machines at once — for example a **Linux box
+with an NVIDIA GPU** and a **MacBook on Apple Silicon** — pooling their compute on
+one shared model. Each node computes on its **local** accelerator (CUDA, MPS or CPU)
+and gradients are averaged every step over the cross-platform **gloo** backend (CPU
+transport), so heterogeneous CUDA + MPS clusters just work — no NCCL required.
+
+```
+        ┌── Linux (rank 0, CUDA) ──┐        averaged gradients (gloo / TCP)
+        │   forward / backward     │◄──────────────────────────────────────┐
+        └──────────┬───────────────┘                                        │
+                   │ writes checkpoints/latest.pt (hot-reload)              │
+        ┌──────────┴───────────────┐                                        │
+        │   Mac M1 (rank 1, MPS)   │────────────────────────────────────────┘
+        │   forward / backward     │
+        └──────────────────────────┘
+```
+
+Run **on each machine** (same `WORLD_SIZE`, same master address/port). Rank 0 is the
+master and is the only node that writes `checkpoints/latest.pt`:
+
+```bash
+# On the Linux master (its LAN IP is e.g. 192.168.1.10) — rank 0:
+MASTER_ADDR=192.168.1.10 WORLD_SIZE=2 RANK=0 ./scripts/run_distributed.sh
+
+# On the Mac M1 — rank 1:
+MASTER_ADDR=192.168.1.10 WORLD_SIZE=2 RANK=1 ./scripts/run_distributed.sh
+```
+
+Each node needs its own copy of the training shards (`data/shards/`); a
+`DistributedSampler` gives every rank a disjoint slice so no sample is seen twice
+per step. Tune the backend, ports and timeout under the `distributed:` section of
+[`config.yaml`](config.yaml). On a single machine with multiple NVIDIA GPUs, set
+`BACKEND=nccl` for faster GPU-to-GPU communication.
+
+> The master port must be reachable from the other nodes (open it on the LAN /
+> firewall). Heterogeneous clusters should keep the default `gloo` backend.
+
 ## Evaluating strength
 
 Run a match in **Cutechess** against Stockfish with `UCI_LimitStrength` / a fixed Elo to
@@ -213,6 +256,9 @@ estimate rating and track progress across checkpoints.
 
 ## Roadmap
 
+- [x] Squeeze-Excitation residual blocks
+- [x] Distributed multi-device training (Mac M1 + Linux)
+- [x] Apple Silicon (MPS) support
 - [ ] Larger network (e.g. 20×384) and more training data
 - [ ] WDL (win/draw/loss) value head
 - [ ] Self-play reinforcement learning on top of the supervised base

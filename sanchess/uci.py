@@ -14,9 +14,10 @@ from pathlib import Path
 import chess
 import torch
 
-from .model import build_model
+from .model import build_model, build_model_from_checkpoint
 from .search.mcts import MCTS, Evaluator, best_move
-from .utils import load_checkpoint, load_config
+from .utils import (load_checkpoint, load_config, load_model_state,
+                    resolve_device)
 
 NAME = "San-o1"
 AUTHOR = "San-o1 project"
@@ -25,8 +26,7 @@ AUTHOR = "San-o1 project"
 class Engine:
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        dev = cfg.get("train", {}).get("device", "cuda")
-        self.device = dev if (dev == "cpu" or torch.cuda.is_available()) else "cpu"
+        self.device = resolve_device(cfg.get("train", {}).get("device", "auto"))
         self.ckpt_path = Path(cfg["paths"]["latest"])
         self._ckpt_mtime = None
         self.board = chess.Board()
@@ -34,14 +34,15 @@ class Engine:
         self._build_engine()
 
     def _build_engine(self):
-        model = build_model(self.cfg)
         if self.ckpt_path.exists():
             ck = load_checkpoint(self.ckpt_path, map_location=self.device)
-            model.load_state_dict(ck["model_state"])
+            model = build_model_from_checkpoint(ck, self.cfg)
+            load_model_state(model, ck["model_state"])
             self._ckpt_mtime = self.ckpt_path.stat().st_mtime
             sys.stderr.write(f"info string poids chargés depuis {self.ckpt_path} "
                              f"(step {ck.get('step', '?')})\n")
         else:
+            model = build_model(self.cfg)
             sys.stderr.write("info string AUCUN checkpoint -> réseau aléatoire "
                              "(jeu faible, normal avant entraînement)\n")
         self.mcts = MCTS(Evaluator(model, self.device), self.cfg)
