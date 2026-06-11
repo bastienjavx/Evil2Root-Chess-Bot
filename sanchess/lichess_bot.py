@@ -122,6 +122,14 @@ class LichessBot:
             print("ATTENTION : ce compte n'est pas un BOT. Lance --upgrade d'abord.")
             return
         print("En écoute des défis… (envoie un défi à ce compte pour jouer)")
+        # Reprend les parties déjà en cours (essentiel en correspondance : le bot
+        # peut avoir été relancé alors qu'une partie attend son coup).
+        try:
+            for g in self._get("/api/account/playing").get("nowPlaying", []):
+                print(f"[reprise] partie en cours {g['gameId']}")
+                self._start_game(g["gameId"])
+        except Exception as e:
+            print(f"[reprise] échec récupération des parties en cours: {e}")
         while True:
             try:
                 resp = self._stream("/api/stream/event")
@@ -139,10 +147,12 @@ class LichessBot:
         if etype == "challenge":
             self._on_challenge(event["challenge"])
         elif etype == "gameStart":
-            gid = event["game"]["id"]
-            if gid not in self.active_games:
-                self.active_games.add(gid)
-                threading.Thread(target=self._play_game, args=(gid,), daemon=True).start()
+            self._start_game(event["game"]["id"])
+
+    def _start_game(self, gid: str):
+        if gid not in self.active_games:
+            self.active_games.add(gid)
+            threading.Thread(target=self._play_game, args=(gid,), daemon=True).start()
 
     def _on_challenge(self, ch):
         cid = ch["id"]
@@ -163,27 +173,38 @@ class LichessBot:
         print(f"[partie {game_id}] démarrée")
         my_color = None
         initial_fen = "startpos"
-        try:
-            resp = self._stream(f"/api/bot/game/stream/{game_id}")
-            for line in resp.iter_lines():
-                msg = _parse_line(line)
-                if msg is None:
-                    continue
-                t = msg.get("type")
-                if t == "gameFull":
-                    initial_fen = msg.get("initialFen", "startpos")
-                    my_color = (chess.WHITE if msg["white"].get("id") == self.bot_id
-                                else chess.BLACK)
-                    self._maybe_move(game_id, initial_fen, msg["state"], my_color)
-                elif t == "gameState":
-                    if msg.get("status") != "started":
-                        print(f"[partie {game_id}] terminée ({msg.get('status')})")
+        game_over = False
+        # En correspondance, Lichess ferme les flux inactifs après une longue
+        # attente : on se reconnecte tant que la partie n'est pas terminée, sinon
+        # le bot « oublie » la partie et ne rejoue jamais.
+        while not game_over:
+            try:
+                resp = self._stream(f"/api/bot/game/stream/{game_id}")
+                for line in resp.iter_lines():
+                    msg = _parse_line(line)
+                    if msg is None:
+                        continue
+                    t = msg.get("type")
+                    if t == "gameFull":
+                        initial_fen = msg.get("initialFen", "startpos")
+                        my_color = (chess.WHITE if msg["white"].get("id") == self.bot_id
+                                    else chess.BLACK)
+                        state = msg["state"]
+                    elif t == "gameState":
+                        state = msg
+                    else:
+                        continue
+                    if state.get("status", "started") != "started":
+                        print(f"[partie {game_id}] terminée ({state.get('status')})")
+                        game_over = True
                         break
-                    self._maybe_move(game_id, initial_fen, msg, my_color)
-        except Exception as e:
-            print(f"[partie {game_id}] erreur stream: {e}")
-        finally:
-            self.active_games.discard(game_id)
+                    self._maybe_move(game_id, initial_fen, state, my_color)
+            except Exception as e:
+                print(f"[partie {game_id}] erreur stream: {e}")
+            if not game_over:
+                print(f"[partie {game_id}] flux interrompu, reconnexion…")
+                time.sleep(2)
+        self.active_games.discard(game_id)
 
     def _build_board(self, initial_fen: str, moves: str) -> chess.Board:
         board = chess.Board() if initial_fen == "startpos" else chess.Board(initial_fen)
