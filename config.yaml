@@ -116,3 +116,14 @@ bot:
   challenge_clock_limit: 300     # (ignoré quand challenge_correspondence: true)
   challenge_clock_increment: 3   # (ignoré quand challenge_correspondence: true)
   challenge_rated: true          # parties CLASSÉES (affecte l'Elo)
+  # Chat dans la partie : salutations + commandes (!help, !eval, !pv, !top, !info, !rating, !fen…)
+  chat_enabled: true             # répond aux commandes et salue au début/à la fin
+  greeting: "Bonjour {opp} ! Je suis un réseau de neurones maison. Bonne partie — tape !help pour les commandes."
+  goodbye: "gg {opp}, merci pour la partie !"
+  # Nulle / abandon automatiques (courtoisie + ne pas traîner une partie perdue)
+  accept_draw: true              # accepte une nulle proposée si on n'est pas mieux
+  accept_draw_score: -0.50       # éval (point de vue du bot) en dessous de laquelle on accepte
+  resign_enabled: false          # abandonner automatiquement les positions désespérées
+  resign_score: -0.97            # éval sous laquelle un coup compte comme « perdu »
+  resign_streak: 4               # nb de coups perdus d'affilée avant d'abandonner
+  resign_min_move: 12            # n'abandonne pas avant ce numéro de coup (évite l'ouverture)
