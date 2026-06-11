@@ -1,0 +1,21 @@
+[Unit]
+Description=San-o1 — Téléchargement des dumps Lichess (shards)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=evil2root
+Group=evil2root
+WorkingDirectory=/home/evil2root/Bureau/San-o1
+ExecStart=/home/evil2root/Bureau/San-o1/scripts/download_all.sh
+# Job reprenable et fini (parcourt tous les mois puis s'arrête). Redémarre
+# seulement sur crash réseau/process, pas sur fin normale.
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sano1-download
+
+[Install]
+WantedBy=multi-user.target

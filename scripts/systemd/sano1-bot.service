@@ -1,0 +1,21 @@
+[Unit]
+Description=San-o1 — Bot Lichess (Evil2Root)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=evil2root
+Group=evil2root
+WorkingDirectory=/home/evil2root/Bureau/San-o1
+ExecStart=/home/evil2root/Bureau/San-o1/.venv/bin/python -u -m sanchess.lichess_bot
+# Redémarre tout seul s'il plante ou si Lichess est injoignable au boot.
+Restart=always
+RestartSec=5
+# Logs consultables via: journalctl -u sano1-bot -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sano1-bot
+
+[Install]
+WantedBy=multi-user.target

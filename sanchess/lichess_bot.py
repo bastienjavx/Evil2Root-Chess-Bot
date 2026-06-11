@@ -18,9 +18,11 @@ Usage :
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -62,6 +64,9 @@ class SearchEngine:
         self.ckpt_path = Path(cfg["paths"]["latest"])
         self._mtime = None
         self.default_nodes = cfg.get("mcts", {}).get("default_nodes", 800)
+        # Sérialise rechargement de poids et recherches : un seul GPU, et évite
+        # de remplacer self.mcts pendant qu'un thread de partie l'utilise.
+        self._lock = threading.Lock()
         self._build()
 
     def _build(self):
@@ -76,14 +81,23 @@ class SearchEngine:
         self.mcts = MCTS(Evaluator(model, self.device), self.cfg)
 
     def maybe_reload(self):
-        if self.ckpt_path.exists():
+        # Ne JAMAIS laisser une erreur de rechargement remonter : sinon le thread
+        # de la partie meurt et le bot « ne répond plus ». On garde les poids
+        # actuels en cas d'échec (checkpoint en cours d'écriture, OOM, etc.).
+        if not self.ckpt_path.exists():
+            return
+        try:
             m = self.ckpt_path.stat().st_mtime
             if m != self._mtime:
-                self._build()
+                with self._lock:
+                    self._build()
+        except Exception as e:  # noqa: BLE001 — robustesse volontaire
+            sys.stderr.write(f"[engine] rechargement ignoré ({e})\n")
 
     def choose_move(self, board: chess.Board, think_seconds: float | None):
         nodes = 10_000_000 if think_seconds else self.default_nodes
-        root = self.mcts.run(board, nodes, max_seconds=think_seconds)
+        with self._lock:
+            root = self.mcts.run(board, nodes, max_seconds=think_seconds)
         return best_move(root)
 
 
@@ -93,7 +107,10 @@ class LichessBot:
         self.engine = SearchEngine(cfg)
         self.session = requests.Session()
         self.session.headers.update({"Authorization": f"Bearer {token}"})
-        self.account = self._get("/api/account")
+        # Lichess peut être injoignable au démarrage (panne, coupure réseau).
+        # On réessaie indéfiniment au lieu de planter : le bot se connectera tout
+        # seul dès que Lichess revient, sans intervention.
+        self.account = self._get_with_retry("/api/account")
         self.bot_id = self.account["id"]
         bcfg = cfg.get("bot", {})
         self.accept_variants = set(bcfg.get("accept_variants", ["standard"]))
@@ -106,6 +123,14 @@ class LichessBot:
         r = self.session.get(API + path, timeout=30, **kw)
         r.raise_for_status()
         return r.json()
+
+    def _get_with_retry(self, path, delay: float = 5.0):
+        while True:
+            try:
+                return self._get(path)
+            except Exception as e:  # noqa: BLE001 — on attend que Lichess revienne
+                print(f"[connexion] Lichess injoignable ({e}); nouvel essai dans {delay:.0f}s")
+                time.sleep(delay)
 
     def _post(self, path):
         r = self.session.post(API + path, timeout=30)
@@ -235,6 +260,22 @@ class LichessBot:
 
 
 # --- Commandes ---------------------------------------------------------------
+def acquire_single_instance_lock():
+    """Empêche deux bots de tourner avec le même token (ils se voleraient les
+    events Lichess et leurs coups seraient refusés -> « le bot ne répond plus »).
+    Retourne le descripteur du verrou (à garder ouvert toute la vie du process)."""
+    lock_path = Path(tempfile.gettempdir()) / "sanchess_lichess_bot.lock"
+    fd = open(lock_path, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(f"Un bot tourne déjà (verrou {lock_path}). "
+                 f"Arrête-le d'abord : pkill -f sanchess.lichess_bot")
+    fd.write(str(os.getpid()))
+    fd.flush()
+    return fd
+
+
 def get_token() -> str:
     load_dotenv()
     token = os.environ.get("LICHESS_TOKEN")
@@ -284,8 +325,10 @@ def main():
     if args.upgrade:
         cmd_upgrade(token); return
 
+    lock = acquire_single_instance_lock()  # garde le fd ouvert tant que le bot vit
     cfg = load_config(args.config)
     LichessBot(cfg, token).run()
+    del lock
 
 
 if __name__ == "__main__":

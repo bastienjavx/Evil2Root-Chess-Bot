@@ -17,11 +17,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from ..model import build_model
-from ..utils import load_config, save_checkpoint
+from ..utils import load_checkpoint, load_config, save_checkpoint
 from .dataset import ShardDataset, find_shards
 
 
-def train(cfg: dict, shards_dir: str | None):
+def train(cfg: dict, shards_dir: str | None, resume: bool = True):
     tcfg = cfg["train"]
     device = tcfg.get("device", "cuda")
     if device == "cuda" and not torch.cuda.is_available():
@@ -51,8 +51,20 @@ def train(cfg: dict, shards_dir: str | None):
     log_every = tcfg["log_every"]
     ckpt_every = tcfg["checkpoint_every"]
 
-    model.train()
     step = 0
+    if resume and latest.exists():
+        ckpt = load_checkpoint(latest, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        if "optimizer_state" in ckpt:
+            opt.load_state_dict(ckpt["optimizer_state"])
+        step = int(ckpt.get("step", 0))
+        if step >= max_steps:
+            print(f"Reprise depuis {latest} : déjà {step} steps >= {max_steps} "
+                  f"(pretrain_steps). Rien à faire.")
+            return
+        print(f"Reprise depuis {latest} au step {step}/{max_steps}.")
+
+    model.train()
     t0 = time.time()
     running_p = running_v = 0.0
     while step < max_steps:
@@ -100,8 +112,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--shards", default=None)
     ap.add_argument("--config", default=None)
+    ap.add_argument("--no-resume", action="store_true",
+                    help="Repartir de zéro au lieu de reprendre latest.pt.")
     args = ap.parse_args()
-    train(load_config(args.config), args.shards)
+    train(load_config(args.config), args.shards, resume=not args.no_resume)
 
 
 if __name__ == "__main__":

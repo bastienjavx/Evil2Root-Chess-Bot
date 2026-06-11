@@ -1,0 +1,21 @@
+[Unit]
+Description=San-o1 — Pré-entraînement supervisé (pretrain)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=evil2root
+Group=evil2root
+WorkingDirectory=/home/evil2root/Bureau/San-o1
+ExecStart=/home/evil2root/Bureau/San-o1/scripts/run_pretrain.sh
+# Pretrain est un job FINI (s'arrête à pretrain_steps). On ne redémarre que sur
+# crash (OOM, etc.), pas sur fin normale -> pas de boucle de redémarrage.
+Restart=on-failure
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sano1-train
+
+[Install]
+WantedBy=multi-user.target
