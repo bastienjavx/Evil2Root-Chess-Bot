@@ -1,0 +1,21 @@
+[Unit]
+Description=San-o1 — Apprentissage continu en ligne (online)
+After=network-online.target sano1-stream.service
+Wants=network-online.target sano1-stream.service
+
+[Service]
+Type=simple
+User=evil2root
+Group=evil2root
+WorkingDirectory=/home/evil2root/Bureau/San-o1
+# Attend la fin du pretrain (les deux écrivent latest.pt) puis entraîne en boucle.
+ExecStart=/home/evil2root/Bureau/San-o1/scripts/online_after_pretrain.sh
+# Boucle d'entraînement censée tourner en continu -> relance toujours.
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sano1-online
+
+[Install]
+WantedBy=multi-user.target

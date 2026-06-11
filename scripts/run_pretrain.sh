@@ -3,7 +3,7 @@
 cd "$(dirname "$0")/.." || exit 1
 # Interpréteur du venv (chess/torch n'y sont QUE dans le venv).
 PY="$(pwd)/.venv/bin/python"; [ -x "$PY" ] || PY=python3
-# Verrou anti-double-instance : deux entraînements écriraient le même
-# checkpoints/latest.pt et se corrompraient. flock -n échoue tout de suite si
-# un autre run (manuel ou service) tient déjà le verrou.
-exec flock -n /tmp/sano1-pretrain.lock "$PY" -m sanchess.train.pretrain "$@"
+# Verrou « trainer » PARTAGÉ avec l'online : un seul process écrit
+# checkpoints/latest.pt à la fois (pretrain XOR online), sinon corruption.
+# flock -n échoue tout de suite si un autre entraînement tient déjà le verrou.
+exec flock -n /tmp/sano1-trainer.lock "$PY" -m sanchess.train.pretrain "$@"

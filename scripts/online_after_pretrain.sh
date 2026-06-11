@@ -15,4 +15,6 @@ done
 echo "[online-différé] pré-entraînement terminé -> démarrage de l'apprentissage continu"
 
 # Seed avec les shards de pretrain (anti-oubli) + ingestion du replay buffer live.
-exec "$PY" -u -m sanchess.train.online --seed-shards data/shards
+# Verrou « trainer » PARTAGÉ avec le pretrain : garantit qu'un seul process écrit
+# checkpoints/latest.pt (couvre la course où systemd relancerait le pretrain).
+exec flock -n /tmp/sano1-trainer.lock "$PY" -u -m sanchess.train.online --seed-shards data/shards
