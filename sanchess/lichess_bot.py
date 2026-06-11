@@ -34,7 +34,7 @@ import torch
 
 from .model import build_model, build_model_from_checkpoint
 from .search.mcts import MCTS, Evaluator, best_move
-from .utils import load_checkpoint, load_config, load_dotenv, load_model_state
+from .utils import load_checkpoint, load_config, load_dotenv, load_model_state, resolve_device
 
 API = "https://lichess.org"
 
@@ -60,8 +60,10 @@ class SearchEngine:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        dev = cfg.get("train", {}).get("device", "cuda")
-        self.device = dev if (dev == "cpu" or torch.cuda.is_available()) else "cpu"
+        # Résoudre "auto"/"cuda"/"mps" en un id Torch concret : passer "auto"
+        # tel quel à torch.load (map_location) plante car PyTorch ne sait pas
+        # restaurer vers un appareil nommé "auto".
+        self.device = resolve_device(cfg.get("train", {}).get("device", "auto"))
         self.ckpt_path = Path(cfg["paths"]["latest"])
         self._mtime = None
         self.default_nodes = cfg.get("mcts", {}).get("default_nodes", 800)
