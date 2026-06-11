@@ -49,7 +49,13 @@ class Evaluator:
                             enabled=use_cuda):
             logits, values = self.model(t)
         logits = logits.float().cpu().numpy()
-        values = values.float().cpu().numpy().reshape(-1)
+        # Tête WDL (B,3) -> scalaire E[résultat] = P(victoire) - P(défaite) ∈ [-1,1].
+        # Tête scalaire (B,1) -> tel quel. (Détection par la forme : robuste.)
+        if values.dim() == 2 and values.shape[1] == 3:
+            p = torch.softmax(values.float(), dim=1).cpu().numpy()
+            values = p[:, 2] - p[:, 0]
+        else:
+            values = values.float().cpu().numpy().reshape(-1)
 
         out = []
         for i, board in enumerate(boards):

@@ -38,7 +38,6 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -46,6 +45,7 @@ from ..model import build_model
 from ..utils import (amp_enabled, autocast_ctx, load_checkpoint, load_config,
                      load_model_state, resolve_device, save_checkpoint)
 from .dataset import ShardDataset, find_shards
+from .losses import policy_loss, value_loss
 from .pretrain import EMA, lr_at_step
 
 
@@ -129,7 +129,9 @@ def run(cfg: dict, shards_dir: str | None, args, resume: bool = True):
     rank, world, backend = init_distributed(cfg, args)
     is_main = rank == 0
     tcfg = cfg["train"]
-    device = resolve_device(tcfg.get("device", "auto"))
+    # Appareil PAR RANG : permet, sur une seule machine, un rang GPU (cuda) ET un
+    # rang CPU qui s'entraînent ensemble. Priorité : --device > $DEVICE > train.device.
+    device = resolve_device(args.device or _env("DEVICE") or tcfg.get("device", "auto"))
 
     def log(msg: str) -> None:
         if is_main:
@@ -192,9 +194,9 @@ def run(cfg: dict, shards_dir: str | None, args, resume: bool = True):
     while step < max_steps:
         if sampler is not None:
             sampler.set_epoch(epoch)
-        for planes, target_idx, target_val in loader:
+        for planes, target_policy, target_val in loader:
             planes = planes.to(device, non_blocking=True)
-            target_idx = target_idx.to(device, non_blocking=True)
+            target_policy = target_policy.to(device, non_blocking=True)
             target_val = target_val.to(device, non_blocking=True)
 
             lr = lr_at_step(step, base_lr, warmup, max_steps, schedule)
@@ -204,9 +206,8 @@ def run(cfg: dict, shards_dir: str | None, args, resume: bool = True):
             opt.zero_grad(set_to_none=True)
             with autocast_ctx(device, use_amp):
                 logits, value = model(planes)
-                loss_p = F.cross_entropy(logits, target_idx,
-                                         label_smoothing=label_smooth)
-                loss_v = F.mse_loss(value.squeeze(1), target_val)
+                loss_p = policy_loss(logits, target_policy, label_smooth)
+                loss_v = value_loss(value, target_val)
                 loss = loss_p + vlw * loss_v
 
             scaler.scale(loss).backward()
@@ -275,6 +276,8 @@ def main():
     ap.add_argument("--master-addr", default=None, dest="master_addr")
     ap.add_argument("--master-port", type=int, default=None, dest="master_port")
     ap.add_argument("--backend", default=None, help="gloo (défaut, cross-platform) ou nccl")
+    ap.add_argument("--device", default=None,
+                    help="appareil de CE rang (cuda/mps/cpu) ; sinon $DEVICE puis train.device")
     ap.add_argument("--no-resume", action="store_true")
     args = ap.parse_args()
     run(load_config(args.config), args.shards, args, resume=not args.no_resume)

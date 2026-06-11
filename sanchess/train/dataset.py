@@ -10,8 +10,9 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from ..data.samples import iter_samples
-from ..encoding import encode_board, move_to_index
+from ..data.samples import iter_samples_pi
+from ..encoding import encode_board
+from .losses import dense_policy_target
 
 
 def find_shards(shards_dir: str | Path) -> list[Path]:
@@ -32,9 +33,9 @@ class ShardDataset(Dataset):
         paths = list(shard_paths)
         if max_samples:
             random.Random(seed).shuffle(paths)
-        self.rows: list[tuple[str, str, int]] = []
+        self.rows: list[tuple] = []
         for p in paths:
-            self.rows.extend(iter_samples(p))
+            self.rows.extend(iter_samples_pi(p))
             if max_samples and len(self.rows) >= max_samples:
                 del self.rows[max_samples:]
                 break
@@ -45,10 +46,13 @@ class ShardDataset(Dataset):
         return len(self.rows)
 
     def __getitem__(self, i: int):
-        fen, move_uci, value = self.rows[i]
+        fen, move_uci, value, pi = self.rows[i]
         board = chess.Board(fen)
         planes = encode_board(board)
-        idx = move_to_index(chess.Move.from_uci(move_uci), board.turn)
+        # Cible politique DENSE (POLICY_SIZE) : distribution de visites si dispo
+        # (self-play), sinon one-hot du coup joué (samples humains) -> CE souple
+        # identique à l'ancienne CE dure dans ce cas.
+        policy = dense_policy_target(board, move_uci, pi)
         return (torch.from_numpy(planes),
-                torch.tensor(idx, dtype=torch.long),
+                torch.from_numpy(policy),
                 torch.tensor(value, dtype=torch.float32))

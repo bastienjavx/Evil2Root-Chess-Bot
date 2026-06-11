@@ -160,6 +160,41 @@ python -m sanchess.lichess_bot --check     # show account status (read-only)
 The collector feeds a replay buffer from live games while the trainer fine-tunes and refreshes
 `checkpoints/latest.pt`; the engine hot-reloads it between games.
 
+### 5 — Web console (API + live play + stats)
+
+A self-contained web UI (`sanchess.web`) to **play the model live**, watch it play **itself**,
+browse the exposed **checkpoints**, and monitor **training / system** stats in real time.
+
+```bash
+pip install fastapi "uvicorn[standard]"   # one-time (already in requirements.txt)
+./scripts/run_web.sh                        # -> http://localhost:8000
+CLOUDFLARED=1 ./scripts/run_web.sh          # + public tunnel (*.trycloudflare.com)
+```
+
+Tabs: **Jouer** (human vs model, choose checkpoint + node/time budget, see the model's
+candidate moves & eval), **Regarder** (model vs model, streamed move-by-move over WebSocket),
+**Modèles** (every `checkpoints/*.pt` with step/arch/size), **Entraînement** (policy/value/loss
+curves parsed from `data/*.log`), **Système** (GPU, systemd services, replay buffer, processes).
+
+The engine **hot-reloads `latest.pt`**, so the live UI tracks ongoing training. All chess logic
+(legality, SAN, game-over) runs server-side — the frontend has **zero external dependencies**.
+
+API surface (full schema at `/docs`):
+
+| Method | Route | Purpose |
+|--------|-------|---------|
+| `GET`  | `/api/models`   | checkpoints + metadata, active device |
+| `GET`  | `/api/legal`    | legal moves of a position (FEN/UCI moves) |
+| `POST` | `/api/analyze`  | MCTS analysis: bestmove, value, candidates |
+| `POST` | `/api/move`     | model plays one move on a position |
+| `GET`  | `/api/training` | policy/value/loss series from logs |
+| `GET`  | `/api/system`   | GPU / services / buffer / processes |
+| `WS`   | `/ws/play`      | human-vs-model game, one move per message |
+| `WS`   | `/ws/selfplay`  | model-vs-model game, streamed |
+
+Run it as a service (auto-start on boot): copy `scripts/systemd/sano1-web.service` to
+`/etc/systemd/system/` then `sudo systemctl enable --now sano1-web`.
+
 ## Project structure
 
 ```
@@ -176,11 +211,17 @@ sanchess/
 │   ├── pgn_to_samples.py  PGN → shards (streamed, Elo-filtered)
 │   ├── stream.py          live Lichess games → replay buffer
 │   └── samples.py         shared sample format (gzip text)
-└── train/
-    ├── dataset.py         PyTorch dataset (on-the-fly encoding)
-    ├── pretrain.py        supervised pre-training (AMP, LR schedule, EMA)
-    ├── distributed.py     multi-machine data-parallel trainer (Mac M1 + Linux)
-    └── online.py          continuous learning + hot-reload checkpoints
+├── train/
+│   ├── dataset.py         PyTorch dataset (on-the-fly encoding)
+│   ├── pretrain.py        supervised pre-training (AMP, LR schedule, EMA)
+│   ├── distributed.py     multi-machine data-parallel trainer (Mac M1 + Linux)
+│   ├── selfplay.py        CPU self-play → replay buffer
+│   └── online.py          continuous learning + hot-reload checkpoints
+└── web/
+    ├── server.py          FastAPI app (REST + WebSocket)
+    ├── engine.py          model manager: load/hot-reload, MCTS analysis
+    ├── stats.py           log parsing + GPU/services/data status
+    └── static/            zero-dependency frontend (board, charts, live play)
 scripts/                   one-command launchers
 tests/                     encoding round-trip tests
 config.yaml                all hyperparameters

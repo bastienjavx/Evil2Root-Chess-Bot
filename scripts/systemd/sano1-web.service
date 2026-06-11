@@ -1,0 +1,24 @@
+[Unit]
+Description=San-o1 — Interface web (API REST + WebSocket + frontend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=evil2root
+Group=evil2root
+WorkingDirectory=/home/evil2root/Bureau/San-o1
+# Port et host surchargeables ici (defaut 0.0.0.0:8000).
+Environment=SANO1_WEB_HOST=0.0.0.0
+Environment=SANO1_WEB_PORT=8000
+# Pour exposer publiquement via Cloudflare, lancer plutot scripts/run_web.sh
+# avec CLOUDFLARED=1, ou ajouter un service cloudflared dedie.
+ExecStart=/home/evil2root/Bureau/San-o1/.venv/bin/python -u -m sanchess.web
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sano1-web
+
+[Install]
+WantedBy=multi-user.target

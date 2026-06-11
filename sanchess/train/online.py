@@ -18,22 +18,24 @@ from pathlib import Path
 import chess
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-from ..data.samples import iter_samples
-from ..encoding import encode_board, move_to_index
+from ..data.samples import iter_samples_pi
+from ..encoding import encode_board
 from ..model import build_model
 from ..utils import (load_checkpoint, load_config, load_model_state,
                      resolve_device, save_checkpoint)
+from .losses import dense_policy_target, policy_loss, value_loss
 
 
 def _encode_batch(rows, device):
-    planes = np.stack([encode_board(chess.Board(f)) for f, _, _ in rows])
-    idx = np.fromiter((move_to_index(chess.Move.from_uci(m), chess.Board(f).turn)
-                       for f, m, _ in rows), dtype=np.int64, count=len(rows))
-    val = np.fromiter((v for _, _, v in rows), dtype=np.float32, count=len(rows))
+    boards = [chess.Board(f) for f, _, _, _ in rows]
+    planes = np.stack([encode_board(b) for b in boards])
+    # Cible politique DENSE : distribution de visites (self-play) ou one-hot (humain).
+    policy = np.stack([dense_policy_target(b, m, pi)
+                       for b, (_, m, _, pi) in zip(boards, rows)])
+    val = np.fromiter((v for _, _, v, _ in rows), dtype=np.float32, count=len(rows))
     return (torch.from_numpy(planes).to(device),
-            torch.from_numpy(idx).to(device),
+            torch.from_numpy(policy).to(device),
             torch.from_numpy(val).to(device))
 
 
@@ -43,7 +45,7 @@ def _ingest_new_shards(buffer_dir: Path, processed: set, buf: deque) -> int:
         if shard.name in processed:
             continue
         try:
-            for row in iter_samples(shard):
+            for row in iter_samples_pi(shard):
                 buf.append(row)
                 n += 1
         except (OSError, EOFError):
@@ -77,7 +79,7 @@ def run(cfg: dict, seed_shards: str | None):
 
     if seed_shards:
         for shard in sorted(Path(seed_shards).glob("*.txt.gz")):
-            for row in iter_samples(shard):
+            for row in iter_samples_pi(shard):
                 buf.append(row)
         print(f"Buffer initialisé avec {len(buf)} samples (seed).")
 
@@ -99,11 +101,11 @@ def run(cfg: dict, seed_shards: str | None):
 
         if len(buf) >= min_buffer and now - last_step_t >= step_every:
             rows = random.sample(buf, min(batch_size, len(buf)))
-            planes, idx, val = _encode_batch(rows, device)
+            planes, target_policy, val = _encode_batch(rows, device)
             opt.zero_grad(set_to_none=True)
             logits, value = model(planes)
-            loss = (F.cross_entropy(logits, idx)
-                    + cfg["train"]["value_loss_weight"] * F.mse_loss(value.squeeze(1), val))
+            loss = (policy_loss(logits, target_policy)
+                    + cfg["train"]["value_loss_weight"] * value_loss(value, val))
             loss.backward()
             opt.step()
             step += 1

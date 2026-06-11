@@ -13,3 +13,7 @@ requests>=2.31       # API Lichess (stream temps réel)
 # Config / utilitaires
 pyyaml>=6.0
 tqdm>=4.66
+
+# Interface web (API REST + WebSocket + frontend) — sanchess.web
+fastapi>=0.110
+uvicorn[standard]>=0.27

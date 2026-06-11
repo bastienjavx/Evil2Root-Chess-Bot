@@ -10,7 +10,9 @@ model:
   value_hidden: 256      # largeur de la couche cachée de la tête valeur
   value_channels: 32     # canaux de la conv 1x1 de la tête valeur (8 = legacy)
   policy_size: 4672      # 64 cases x 73 types de coups (encodage AlphaZero) — NE PAS changer
-  value_head: scalar     # "scalar" (tanh) — réservé pour extension WDL
+  value_head: wdl        # "scalar" (tanh, MSE) ou "wdl" (3 logits défaite/nulle/victoire,
+                         # cross-entropy ; le MCTS utilise E[résultat]=P(V)-P(D)). Changer
+                         # de tête = ré-entraîner (formes de poids différentes).
 
 mcts:
   c_puct: 1.5
@@ -62,13 +64,31 @@ paths:
   checkpoint_dir: checkpoints
   latest: checkpoints/latest.pt
 
+# Self-play CPU (data generation) tournant EN PARALLÈLE de l'entraînement GPU.
+# Le CPU joue des parties via MCTS et écrit des shards dans data/replay_buffer ;
+# online.py les ingère. Aucune synchro bloquante -> le GPU n'attend pas le CPU.
+# Cf. `python -m sanchess.train.selfplay` et `scripts/run_selfplay.sh`.
+# Garde-fous CPU (cette machine a déjà figé) : workers + threads bornés, nice bas.
+selfplay:
+  device: cpu            # cpu = laisse tout le GPU à l'entraînement
+  workers: 4             # parties en parallèle (≈ 1 cœur/worker ; <12 = marge bureau)
+  threads_per_worker: 1  # threads torch par worker (1 -> 1 cœur, évite la sur-souscription)
+  nice: 10               # priorité basse : ne peut pas étrangler le bureau
+  nodes: 160             # simulations MCTS/coup (↓ = parties plus rapides, ↑ = meilleures)
+  max_plies: 250         # coupe les parties interminables
+  temp_moves: 20         # 1ers coups échantillonnés (diversité d'ouvertures)
+  temperature: 1.0       # température d'échantillonnage sur les visites
+  dirichlet_eps: 0.25    # bruit racine (exploration ; 0 en match)
+  dirichlet_alpha: 0.3
+  flush_games: 4         # écrit un shard tous les N parties
+
 # Entraînement distribué multi-appareils (data-parallel synchrone).
 # Conçu pour un cluster HÉTÉROGÈNE Mac M1 (MPS) + Linux (CUDA/CPU) : chaque nœud
 # calcule en local, les gradients sont moyennés via gloo (CPU) -> cross-platform.
 # Cf. `python -m sanchess.train.distributed` et `scripts/run_distributed.sh`.
 distributed:
   backend: gloo          # "gloo" (Mac+Linux, recommandé) ou "nccl" (Linux multi-GPU)
-  master_addr: 127.0.0.1 # IP du rang 0 (le nœud master) sur le réseau local
+  master_addr: 192.168.0.166 # IP LAN du rang 0 (cette machine Linux = master)
   master_port: 29500     # port de rendez-vous (doit être ouvert sur le master)
   timeout_sec: 1800      # délai d'attente d'initialisation du groupe
 
