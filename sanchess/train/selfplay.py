@@ -31,6 +31,11 @@ import os
 import time
 from pathlib import Path
 
+try:
+    import resource                                   # POSIX uniquement
+except ImportError:                                   # pragma: no cover - Windows
+    resource = None
+
 import chess
 import numpy as np
 import torch
@@ -105,8 +110,24 @@ def _maybe_reload(model, latest: Path, mtime, device):
     return mtime
 
 
+def _limit_memory(mem_limit_mb: int) -> None:
+    """Plafond RAM DUR du process courant (RLIMIT_AS). Au-delà, l'allocation
+    échoue (MemoryError) et le worker meurt seul -> JAMAIS de saturation du swap
+    qui fige tout le PC. <=0 désactive (pas de plafond)."""
+    if mem_limit_mb <= 0 or resource is None:
+        return
+    nbytes = int(mem_limit_mb) * 1024 * 1024
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        cap = nbytes if hard == resource.RLIM_INFINITY else min(nbytes, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
+    except (ValueError, OSError):
+        pass                                           # cap refusé : on continue sans
+
+
 def run_worker(wid: int, cfg: dict, device: str, args):
     s = _scfg(cfg)
+    _limit_memory(int(args.mem_limit_mb))              # plafond RAM/worker (anti-freeze)
     torch.set_num_threads(max(1, int(args.threads)))   # ne pas saturer les cœurs
     try:
         os.nice(int(args.nice))                        # priorité basse (anti-freeze)
@@ -176,13 +197,21 @@ def main():
     ap.add_argument("--flush-games", type=int, default=int(s.get("flush_games", 4)),
                     dest="flush_games", help="écrire un shard tous les N parties")
     ap.add_argument("--nice", type=int, default=int(s.get("nice", 10)))
+    ap.add_argument("--mem-limit-mb", type=int,
+                    default=int(s.get("mem_limit_mb", 2048)), dest="mem_limit_mb",
+                    help="plafond RAM DUR par worker en Mo (0 = illimité). "
+                         "Total RAM ≈ workers × mem_limit_mb.")
     args = ap.parse_args()
     if args.config:
         cfg = load_config(args.config)
 
     device = resolve_device(args.device)
+    mem = (f"{args.mem_limit_mb} Mo/worker (~{args.workers * args.mem_limit_mb} Mo total)"
+           if args.mem_limit_mb > 0 else "illimité")
     print(f"Self-play : {args.workers} worker(s) sur {device} "
-          f"(nice={args.nice}, {args.threads} thread(s)/worker).")
+          f"(nice={args.nice}, {args.threads} thread(s)/worker, RAM {mem}).")
+    if args.mem_limit_mb > 0 and resource is None:
+        print("⚠ RLIMIT_AS indisponible sur cette plateforme : plafond RAM ignoré.")
 
     if args.workers <= 1:
         run_worker(0, cfg, device, args)

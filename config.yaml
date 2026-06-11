@@ -74,6 +74,10 @@ selfplay:
   workers: 4             # parties en parallèle (≈ 1 cœur/worker ; <12 = marge bureau)
   threads_per_worker: 1  # threads torch par worker (1 -> 1 cœur, évite la sur-souscription)
   nice: 10               # priorité basse : ne peut pas étrangler le bureau
+  mem_limit_mb: 2048     # plafond RAM DUR par worker (Mo). Anti-freeze : au-delà le
+                         # worker lève MemoryError et meurt seul au lieu de saturer le
+                         # swap et figer le PC. Total ≈ workers × mem_limit_mb (ici ~8 Go
+                         # pour 4 workers). 0 = illimité. À ajuster selon `free -h`.
   nodes: 160             # simulations MCTS/coup (↓ = parties plus rapides, ↑ = meilleures)
   max_plies: 250         # coupe les parties interminables
   temp_moves: 20         # 1ers coups échantillonnés (diversité d'ouvertures)
