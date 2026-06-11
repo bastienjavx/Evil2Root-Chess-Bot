@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>San-o1 · Console</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9822;</text></svg>">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="logo">&#9822;</span>
+    <div>
+      <h1>San-o1</h1>
+      <div class="sub">Console neuronale d'échecs · <span id="device-badge">…</span></div>
+    </div>
+  </div>
+  <nav id="tabs">
+    <button class="tab active" data-tab="play">Jouer</button>
+    <button class="tab" data-tab="watch">Regarder</button>
+    <button class="tab" data-tab="models">Modèles</button>
+    <button class="tab" data-tab="train">Entraînement</button>
+    <button class="tab" data-tab="system">Système</button>
+  </nav>
+  <div id="conn" class="conn">●</div>
+</header>
+
+<main>
+  <!-- ===================== JOUER ===================== -->
+  <section id="play" class="panel active">
+    <div class="board-col">
+      <div class="board-wrap">
+        <div class="evalbar"><div class="evalbar-fill" id="play-eval"></div></div>
+        <div id="play-board" class="board"></div>
+      </div>
+      <div class="board-controls">
+        <button id="play-new" class="btn primary">Nouvelle partie</button>
+        <button id="play-flip" class="btn">Retourner</button>
+        <button id="play-undo" class="btn">Annuler</button>
+        <select id="play-side" class="sel">
+          <option value="white">Je joue Blancs</option>
+          <option value="black">Je joue Noirs</option>
+        </select>
+      </div>
+      <div id="play-status" class="status">Choisissez vos réglages puis jouez un coup.</div>
+    </div>
+    <aside class="side">
+      <h3>Adversaire (modèle)</h3>
+      <label>Checkpoint
+        <select id="play-model" class="sel"></select>
+      </label>
+      <label>Budget de réflexion
+        <select id="play-budget" class="sel">
+          <option value="nodes:200">200 nœuds (rapide)</option>
+          <option value="nodes:800" selected>800 nœuds</option>
+          <option value="nodes:2000">2000 nœuds (fort)</option>
+          <option value="movetime:2">2 s / coup</option>
+          <option value="movetime:5">5 s / coup</option>
+        </select>
+      </label>
+      <div class="eval-readout" id="play-readout">
+        <div class="big" id="play-cp">—</div>
+        <div class="muted">évaluation du modèle</div>
+      </div>
+      <h3>Réflexion du modèle</h3>
+      <table class="moves-table" id="play-thinking"><tbody></tbody></table>
+      <h3>Coups</h3>
+      <div id="play-movelist" class="movelist"></div>
+    </aside>
+  </section>
+
+  <!-- ===================== REGARDER ===================== -->
+  <section id="watch" class="panel">
+    <div class="board-col">
+      <div class="board-wrap">
+        <div class="evalbar"><div class="evalbar-fill" id="watch-eval"></div></div>
+        <div id="watch-board" class="board"></div>
+      </div>
+      <div class="board-controls">
+        <button id="watch-start" class="btn primary">Lancer la partie</button>
+        <button id="watch-stop" class="btn" disabled>Stopper</button>
+      </div>
+      <div id="watch-status" class="status">Le modèle joue contre lui-même, en direct.</div>
+    </div>
+    <aside class="side">
+      <h3>Réglages</h3>
+      <label>Blancs <select id="watch-white" class="sel"></select></label>
+      <label>Noirs <select id="watch-black" class="sel"></select></label>
+      <label>Nœuds / coup
+        <select id="watch-nodes" class="sel">
+          <option value="100">100</option>
+          <option value="200" selected>200</option>
+          <option value="400">400</option>
+          <option value="800">800</option>
+        </select>
+      </label>
+      <div class="eval-readout">
+        <div class="big" id="watch-cp">—</div>
+        <div class="muted">éval · <span id="watch-nps">0</span> nps</div>
+      </div>
+      <h3>Réflexion</h3>
+      <table class="moves-table" id="watch-thinking"><tbody></tbody></table>
+      <h3>Coups</h3>
+      <div id="watch-movelist" class="movelist"></div>
+    </aside>
+  </section>
+
+  <!-- ===================== MODELES ===================== -->
+  <section id="models" class="panel">
+    <div class="wide">
+      <div class="row-between">
+        <h2>Checkpoints exposés</h2>
+        <button id="models-refresh" class="btn">Rafraîchir</button>
+      </div>
+      <table class="data-table" id="models-table">
+        <thead><tr>
+          <th>Fichier</th><th>Step</th><th>Archi</th><th>Tête politique</th>
+          <th>Activation</th><th>Taille</th><th>Modifié</th><th></th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===================== ENTRAINEMENT ===================== -->
+  <section id="train" class="panel">
+    <div class="wide">
+      <div class="row-between">
+        <h2>Entraînement</h2>
+        <label class="inline-check"><input type="checkbox" id="train-auto" checked> auto-refresh</label>
+      </div>
+      <div class="cards" id="train-cards"></div>
+      <div class="chart-card">
+        <h3>Pré-entraînement — perte politique</h3>
+        <svg id="chart-policy" class="chart" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="chart-card">
+        <h3>Pré-entraînement — perte valeur</h3>
+        <svg id="chart-value" class="chart" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="chart-card">
+        <h3>Online — perte</h3>
+        <svg id="chart-online" class="chart" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== SYSTEME ===================== -->
+  <section id="system" class="panel">
+    <div class="wide">
+      <div class="row-between">
+        <h2>Système</h2>
+        <label class="inline-check"><input type="checkbox" id="sys-auto" checked> auto-refresh</label>
+      </div>
+      <div class="cards" id="sys-gpu"></div>
+      <h3>Services systemd</h3>
+      <div class="chips" id="sys-services"></div>
+      <h3>Données</h3>
+      <div class="cards" id="sys-data"></div>
+      <h3>Process d'entraînement</h3>
+      <div class="chips" id="sys-procs"></div>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
