@@ -392,6 +392,7 @@ class LichessBot:
             print(f"[défi-bot] défi envoyé à {username} ({kind}, {label})")
         else:
             print(f"[défi-bot] échec défi {username}: {r.status_code} {r.text[:120]}")
+        return r.status_code
 
     def _challenge_loop(self):
         """Défie périodiquement un bot en ligne tant qu'on est sous le quota de
@@ -400,6 +401,7 @@ class LichessBot:
         bcfg = self.cfg.get("bot", {})
         interval = bcfg.get("challenge_interval_sec", 60)
         cooldown = bcfg.get("challenge_cooldown_sec", 600)
+        backoff_429 = bcfg.get("challenge_429_backoff_sec", 120)
         max_games = bcfg.get("max_concurrent_games", 1)
         print(f"[défi-bot] activé : défie un bot en ligne toutes les {interval}s "
               f"si < {max_games} partie(s) en cours. {len(self.challenge_modes)} cadence(s).")
@@ -416,7 +418,13 @@ class LichessBot:
                     continue
                 opp = random.choice(candidates)
                 self._recent_challenges[opp] = now
-                self._send_challenge(opp, random.choice(self.challenge_modes))
+                status = self._send_challenge(opp, random.choice(self.challenge_modes))
+                if status == 429:
+                    # Lichess nous rate-limite : insister aggrave (le compteur se
+                    # réarme à chaque requête). On suspend les défis le temps que
+                    # la fenêtre se libère au lieu de retaper toutes les `interval`s.
+                    print(f"[défi-bot] rate-limit (429) -> pause {backoff_429}s")
+                    time.sleep(backoff_429)
             except Exception as e:  # noqa: BLE001 — le thread ne doit jamais mourir
                 print(f"[défi-bot] erreur: {e}")
 

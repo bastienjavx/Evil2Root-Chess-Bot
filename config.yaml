@@ -119,6 +119,8 @@ bot:
   challenge_bots: true           # active l'envoi périodique de défis à d'autres bots
   challenge_interval_sec: 60     # fréquence de tentative d'envoi
   challenge_cooldown_sec: 600    # délai mini avant de re-défier le même bot
+  challenge_429_backoff_sec: 120 # pause après un 429 (rate-limit Lichess) : insister
+                                 # réarme le compteur, donc on attend que ça se libère
   max_concurrent_games: 4        # plafond de parties simultanées (temps-réel : éviter le flag)
   challenge_rated: true          # parties CLASSÉES par défaut (surchargeable par mode)
   # Cadences proposées aux autres bots : UNE est tirée au hasard à chaque défi.
