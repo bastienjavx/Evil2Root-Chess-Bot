@@ -44,6 +44,7 @@ import chess
 import requests
 import torch
 
+from .data.samples import write_samples
 from .model import build_model, build_model_from_checkpoint
 from .search.mcts import MCTS, Evaluator, best_move
 from .utils import load_checkpoint, load_config, load_dotenv, load_model_state, resolve_device
@@ -62,6 +63,9 @@ class MoveAnalysis:
     pv_san: str           # variante principale en notation SAN
     top: list             # [(san, visites, valeur_bot), ...] triés par visites
     step: "int | None"    # pas d'entraînement du checkpoint courant
+    visit_counts: dict = field(default_factory=dict)  # {uci: visites} COMPLET
+                          # (cible politique AlphaZero pour l'apprentissage sur
+                          # les parties réelles du bot — cf. _record_game)
 
     def eval_str(self) -> str:
         s = f"+{self.score:.2f}" if self.score >= 0 else f"{self.score:.2f}"
@@ -165,6 +169,9 @@ class SearchEngine:
         score = max(-1.0, min(1.0, score))
         children = sorted(root.children.items(), key=lambda kv: kv[1].N, reverse=True)
         top = [(board.san(m), c.N, (-c.q() if c.N else 0.0)) for m, c in children[:5]]
+        # Distribution de visites COMPLÈTE (pas seulement le top 5) : c'est la
+        # cible politique AlphaZero quand on apprend des parties réelles du bot.
+        visit_counts = {m.uci(): c.N for m, c in root.children.items() if c.N > 0}
         return MoveAnalysis(
             move=mv,
             move_san=board.san(mv),
@@ -174,6 +181,7 @@ class SearchEngine:
             pv_san=self._principal_variation(root, board),
             top=top,
             step=self.step,
+            visit_counts=visit_counts,
         )
 
 
@@ -189,6 +197,11 @@ class _Game:
     greeted: bool = False
     bad_streak: int = 0                    # coups d'affilée jugés perdus (abandon)
     moves_played: int = 0                  # coups joués par le bot dans la partie
+    # Apprentissage RL : (fen, coup_uci, {uci: visites}, éval_bot) pour CHAQUE
+    # coup que le bot joue. À la fin, on y ajoute le résultat réel comme valeur
+    # (cf. _record_game) ; l'éval sert à détecter les gaffes (chute d'éval) pour
+    # les sur-échantillonner. Shard au format AlphaZero ingéré par train/online.py.
+    records: list = field(default_factory=list)
 
 
 class LichessBot:
@@ -226,6 +239,18 @@ class LichessBot:
         self.resign_min_move = int(bcfg.get("resign_min_move", 12))
         self.accept_draw = bool(bcfg.get("accept_draw", True))
         self.accept_draw_score = float(bcfg.get("accept_draw_score", -0.50))
+        # --- Apprentissage des parties réelles du bot (boucle RL) -------------
+        # Chaque partie terminée est écrite dans le replay buffer (format
+        # AlphaZero : valeur = résultat réel, politique = visites MCTS), que
+        # train/online.py ingère pour améliorer les poids -> le bot apprend de
+        # ses propres victoires ET de ses défaites.
+        self.learn_from_games = bool(bcfg.get("learn_from_games", True))
+        self.buffer_dir = Path(cfg.get("data", {}).get("buffer_dir", "data/replay_buffer"))
+        # Sur-échantillonnage des gaffes : une position « erreur » est écrite N
+        # fois dans le shard -> le buffer la tire d'autant plus (priorisation par
+        # répétition, sans toucher au format partagé). 1 = poids égal pour toutes.
+        self.blunder_weight = max(1, int(bcfg.get("learn_blunder_weight", 3)))
+        self.blunder_threshold = float(bcfg.get("learn_blunder_threshold", 0.30))
 
     @property
     def active_games(self) -> set[str]:
@@ -467,6 +492,7 @@ class LichessBot:
                         continue
                     if state.get("status", "started") != "started":
                         print(f"[partie {game_id}] terminée ({state.get('status')})")
+                        self._record_game(g, state)   # RL : apprendre de cette partie
                         self._farewell(g, state.get("status"))
                         game_over = True
                         break
@@ -516,6 +542,71 @@ class LichessBot:
         if status == "aborted" or not self.chat_enabled:
             return
         self._chat(g.id, self.goodbye.format(opp=g.opponent, me=self.username))
+
+    def _record_game(self, g: _Game, state: dict) -> None:
+        """Écrit la partie terminée dans le replay buffer pour l'apprentissage.
+
+        Format AlphaZero (cf. data/samples.py), identique au self-play :
+          - valeur = résultat réel DU POINT DE VUE DU BOT (gagné +1, nul 0,
+            perdu -1) -> la tête valeur apprend que ses positions perdues
+            l'étaient (apprend de ses erreurs) ;
+          - politique = distribution de visites MCTS du coup joué (meilleure que
+            le réseau brut -> renforce la recherche, même dans une partie perdue).
+        Les positions GAFFÉES (éval qui s'effondre, ou surévaluation vs résultat
+        réel) sont écrites `blunder_weight` fois -> sur-échantillonnées par le
+        buffer : le bot apprend davantage de ses erreurs.
+        train/online.py ingère ce shard automatiquement (glob *.txt.gz).
+        Jamais fatal : un échec d'écriture ne doit pas tuer le thread de partie.
+        """
+        if not self.learn_from_games or not g.records:
+            return
+        status = state.get("status")
+        if status == "aborted":            # personne n'a vraiment joué
+            return
+        winner = state.get("winner")       # "white" | "black" | absent (nulle)
+        if winner == "white":
+            result_white = 1
+        elif winner == "black":
+            result_white = -1
+        else:
+            result_white = 0               # nulle / fin sans vainqueur
+        # Toutes les positions enregistrées ont le bot au trait -> valeur = résultat du bot.
+        result_bot = result_white if g.my_color == chess.WHITE else -result_white
+        recs = g.records
+        n = len(recs)
+        rows: list[tuple] = []
+        blunders = 0
+        for i, (fen, uci, pi, score) in enumerate(recs):
+            row = (fen, uci, result_bot, pi)
+            # Deux signaux d'ERREUR, calibrés pour ne pas tout marquer :
+            #  1) l'éval du bot s'effondre à son coup suivant (chute >= seuil) ;
+            #  2) gain jeté : il se croyait nettement gagnant (>=0.5 ~ 75% de
+            #     score attendu) mais n'a finalement PAS gagné.
+            # (NE PAS utiliser score-result : sur une partie perdue, result=-1
+            # ferait passer presque toute position pour une gaffe -> aucune
+            # priorisation.)
+            drop = (recs[i + 1][3] - score) if i + 1 < n else 0.0
+            collapsed = drop <= -self.blunder_threshold
+            threw_a_win = score >= 0.5 and result_bot <= 0
+            is_mistake = collapsed or threw_a_win
+            copies = self.blunder_weight if (is_mistake and self.blunder_weight > 1) else 1
+            rows.extend([row] * copies)
+            blunders += is_mistake
+        try:
+            self.buffer_dir.mkdir(parents=True, exist_ok=True)
+            name = f"botgame_{g.id}_{int(time.time()*1000)}.txt.gz"
+            tmp = self.buffer_dir / f".{name}.partial"
+            write_samples(tmp, rows)
+            os.replace(tmp, self.buffer_dir / name)  # atomique : l'ingest ne lit jamais un fichier partiel
+            outcome = {1: "gagnée", 0: "nulle", -1: "perdue"}[result_bot]
+            extra = (f", {blunders} gaffe(s) ×{self.blunder_weight}"
+                     if blunders and self.blunder_weight > 1 else "")
+            print(f"[apprentissage {g.id}] partie {outcome} -> +{len(rows)} samples "
+                  f"({n} coups{extra}) dans {name}")
+        except Exception as e:  # noqa: BLE001 — l'apprentissage ne doit jamais casser le bot
+            print(f"[apprentissage {g.id}] échec écriture buffer: {e}")
+        finally:
+            g.records.clear()
 
     def _build_board(self, initial_fen: str, moves: str) -> chess.Board:
         board = chess.Board() if initial_fen == "startpos" else chess.Board(initial_fen)
@@ -567,6 +658,12 @@ class LichessBot:
             print(f"[partie {g.id}] coup refusé {move.uci()}: {r.status_code} {r.text}")
         else:
             g.moves_played += 1
+            # RL : mémorise (position, coup joué, visites MCTS, éval du bot).
+            # La valeur (résultat) sera apposée à la fin de la partie ; l'éval
+            # sert à repérer les gaffes (chute d'éval) pour les sur-échantillonner.
+            if self.learn_from_games and analysis.visit_counts:
+                g.records.append((board.fen(), move.uci(),
+                                  analysis.visit_counts, analysis.score))
 
     @staticmethod
     def _opponent_offers_draw(state, my_color) -> bool:

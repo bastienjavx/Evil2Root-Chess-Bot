@@ -24,7 +24,10 @@ mcts:
 
 train:
   device: auto           # "auto" (CUDA>MPS>CPU), "cuda", "mps" (Mac M1) ou "cpu"
-  batch_size: 512
+  batch_size: 256        # 256 (et non 512) pour COHABITER avec le bot sur le
+                         # même GPU 8 Go : 512 prenait ~3.1 Go et faisait OOM le
+                         # bot. 256 libère ~1.5 Go. Combiné à expandable_segments
+                         # (cf. scripts/run_*.sh), pretrain + bot tiennent ensemble.
   lr: 0.001
   weight_decay: 0.0001
   value_loss_weight: 1.0
@@ -116,7 +119,7 @@ bot:
                                 # « plus vite » doit donner PLUS de nœuds, pas moins
                                 # de temps.
   # Défi automatique d'autres bots Lichess (pour jouer/s'entraîner en continu)
-  challenge_bots: true           # active l'envoi périodique de défis à d'autres bots
+  challenge_bots: false           # active l'envoi périodique de défis à d'autres bots
   challenge_interval_sec: 60     # fréquence de tentative d'envoi
   challenge_cooldown_sec: 600    # délai mini avant de re-défier le même bot
   challenge_429_backoff_sec: 120 # pause après un 429 (rate-limit Lichess) : insister
@@ -138,6 +141,22 @@ bot:
   challenge_days: 3              # jours par coup (valeurs Lichess: 1,2,3,5,7,10,14)
   challenge_clock_limit: 300     # (ignoré quand challenge_correspondence: true)
   challenge_clock_increment: 3   # (ignoré quand challenge_correspondence: true)
+  # Apprentissage RL : le bot apprend de SES PROPRES parties (victoires ET
+  # défaites). Chaque partie terminée est écrite dans data/replay_buffer au
+  # format AlphaZero (valeur = résultat réel, politique = visites MCTS) et
+  # ingérée par train/online.py -> les poids s'améliorent sur ses vraies erreurs.
+  # Boucle complète : jouer -> enregistrer -> entraîner (online) -> recharger à
+  # chaud de meilleurs poids -> rejouer mieux. Désactiver = false.
+  learn_from_games: true
+  # Sur-échantillonnage des GAFFES (« apprendre de ses erreurs » au sens fort) :
+  # une position est marquée « erreur » si l'éval du bot s'effondre à son coup
+  # suivant (chute >= learn_blunder_threshold) OU s'il a JETÉ UN GAIN (il se
+  # croyait nettement gagnant, éval >= 0.5, mais n'a pas gagné). Ces positions
+  # sont écrites learn_blunder_weight fois dans le shard -> le replay buffer les
+  # tire d'autant plus souvent (pas de changement de format : priorisation par
+  # répétition). 1 = désactivé (toutes les positions à poids égal).
+  learn_blunder_weight: 3        # nb de copies d'une position gaffée (1 = off)
+  learn_blunder_threshold: 0.30  # chute d'éval (POV bot, [-1,1]) qui marque une gaffe
   # Chat dans la partie : salutations + commandes (!help, !eval, !pv, !top, !info, !rating, !fen…)
   chat_enabled: true             # répond aux commandes et salue au début/à la fin
   greeting: "Bonjour {opp} ! Je suis un réseau de neurones maison. Bonne partie — tape !help pour les commandes."

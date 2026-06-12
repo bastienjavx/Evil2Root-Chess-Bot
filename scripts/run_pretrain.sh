@@ -3,6 +3,9 @@
 cd "$(dirname "$0")/.." || exit 1
 # Interpréteur du venv (chess/torch n'y sont QUE dans le venv).
 PY="$(pwd)/.venv/bin/python"; [ -x "$PY" ] || PY=python3
+# Allocateur en segments extensibles : limite la fragmentation et le pic mémoire
+# pour cohabiter avec le bot sur le même GPU 8 Go (cf. config train.batch_size: 256).
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Verrou « trainer » PARTAGÉ avec l'online : un seul process écrit
 # checkpoints/latest.pt à la fois (pretrain XOR online), sinon corruption.
 # flock -n échoue tout de suite si un autre entraînement tient déjà le verrou.
