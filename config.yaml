@@ -28,7 +28,7 @@ mcts:
 # Construire un livre depuis nos PGN :  python -m sanchess.data.build_book ...
 # (ou déposer n'importe quel .bin Polyglot : gm2600, Perfect20xx, Cerebellum…)
 book:
-  enabled: false               # passer à true une fois `path` rempli
+  enabled: true                # passer à true une fois `path` rempli
   path: checkpoints/book.bin   # un seul livre ; ou utiliser `paths: [a.bin, b.bin]`
   max_ply: 16                  # profondeur d'utilisation du livre (16 = 8 coups)
   min_weight: 1                # ignore les coups du livre sous ce poids
