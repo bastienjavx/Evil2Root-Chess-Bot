@@ -220,6 +220,15 @@ class LichessBot:
         self.accept_variants = set(bcfg.get("accept_variants", ["standard"]))
         self.think_divisor = bcfg.get("think_divisor", 40)
         self.max_think = bcfg.get("max_think_seconds", 10.0)
+        # Timeout de LECTURE des flux ndjson (event + partie). SANS lui,
+        # iter_lines() bloque pour toujours si la connexion TCP meurt en silence
+        # (demi-ouverte : NAT/routeur/Lichess qui « drop » sans FIN) -> le bot
+        # gèle pendant le tour de l'adversaire (il est en attente de lecture) et
+        # ne rejoue jamais. Lichess émet une ligne keepalive toutes les ~6 s sur
+        # ces flux ; un timeout franchement au-dessus (30 s) ne coupe donc jamais
+        # une connexion vivante, mais transforme une connexion morte en
+        # ReadTimeout -> l'appelant reconnecte (cf. _play_game / run).
+        self.stream_read_timeout = float(bcfg.get("stream_read_timeout_sec", 30.0))
         self.games: dict[str, _Game] = {}
         # Défi automatique d'autres bots (cooldown par adversaire pour ne pas spammer).
         self.challenge_bots = bool(bcfg.get("challenge_bots", False))
@@ -275,7 +284,12 @@ class LichessBot:
         return r
 
     def _stream(self, path):
-        return self.session.get(API + path, stream=True, timeout=None)
+        # timeout=(connect, read) : un timeout de LECTURE est vital. Avec None,
+        # iter_lines() bloque indéfiniment sur une connexion morte en silence et
+        # le bot gèle (cf. self.stream_read_timeout). Le read-timeout lève une
+        # ReadTimeout que l'appelant attrape pour reconnecter.
+        return self.session.get(API + path, stream=True,
+                                timeout=(10.0, self.stream_read_timeout))
 
     # --- Actions de partie ---------------------------------------------------
     def _chat(self, game_id: str, text: str, room: str = "player"):

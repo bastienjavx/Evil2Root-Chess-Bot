@@ -118,6 +118,13 @@ bot:
                                 # 10 s -> ~7000 nœuds. Le MCTS étant 6x plus rapide,
                                 # « plus vite » doit donner PLUS de nœuds, pas moins
                                 # de temps.
+  # Timeout de LECTURE des flux Lichess (event + partie), en secondes. Sans lui
+  # (None), iter_lines() bloque pour toujours si la connexion TCP meurt en
+  # silence (demi-ouverte : NAT/routeur/Lichess qui drop sans FIN) -> le bot gèle
+  # pendant le tour de l'adversaire (il est en attente de lecture) et ne rejoue
+  # jamais. Lichess émet un keepalive ~6 s ; 30 s ne coupe donc jamais une
+  # connexion vivante mais détecte une connexion morte -> reconnexion auto.
+  stream_read_timeout_sec: 30
   # Défi automatique d'autres bots Lichess (pour jouer/s'entraîner en continu)
   challenge_bots: false           # active l'envoi périodique de défis à d'autres bots
   challenge_interval_sec: 60     # fréquence de tentative d'envoi
