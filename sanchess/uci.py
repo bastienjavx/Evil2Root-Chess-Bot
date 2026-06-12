@@ -14,6 +14,7 @@ from pathlib import Path
 import chess
 import torch
 
+from .book import OpeningBook
 from .model import build_model, build_model_from_checkpoint
 from .search.mcts import MCTS, Evaluator, best_move
 from .utils import (load_checkpoint, load_config, load_model_state,
@@ -31,6 +32,7 @@ class Engine:
         self._ckpt_mtime = None
         self.board = chess.Board()
         self.default_nodes = cfg.get("mcts", {}).get("default_nodes", 800)
+        self.book = OpeningBook.from_config(cfg)
         self._build_engine()
 
     def _build_engine(self):
@@ -90,6 +92,13 @@ class Engine:
             remaining = wtime if self.board.turn == chess.WHITE else btime
             if remaining is not None:
                 max_seconds = max(0.05, remaining / 30.0)   # ~1/30 du temps restant
+
+        # Livre d'ouvertures : réponse immédiate tant qu'on est dans la théorie.
+        if self.book is not None:
+            mv = self.book.lookup(self.board)
+            if mv is not None:
+                sys.stderr.write(f"info string livre {mv.uci()}\n")
+                return f"bestmove {mv.uci()}"
 
         num_nodes = nodes if nodes is not None else (
             10_000_000 if max_seconds is not None else self.default_nodes)

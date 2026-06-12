@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 checkpoints/*.pt
+checkpoints/*.bin
 data/lichess_raw/*
 data/shards/*
 data/replay_buffer/*

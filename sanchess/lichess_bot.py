@@ -44,6 +44,7 @@ import chess
 import requests
 import torch
 
+from .book import OpeningBook
 from .data.samples import write_samples
 from .model import build_model, build_model_from_checkpoint
 from .search.mcts import MCTS, Evaluator, best_move
@@ -66,6 +67,7 @@ class MoveAnalysis:
     visit_counts: dict = field(default_factory=dict)  # {uci: visites} COMPLET
                           # (cible politique AlphaZero pour l'apprentissage sur
                           # les parties réelles du bot — cf. _record_game)
+    from_book: bool = False  # coup tiré du livre d'ouvertures (pas du MCTS)
 
     def eval_str(self) -> str:
         s = f"+{self.score:.2f}" if self.score >= 0 else f"{self.score:.2f}"
@@ -103,6 +105,8 @@ class SearchEngine:
         # Sérialise rechargement de poids et recherches : un seul GPU, et évite
         # de remplacer self.mcts pendant qu'un thread de partie l'utilise.
         self._lock = threading.Lock()
+        # Livre d'ouvertures (indépendant des poids -> chargé une seule fois).
+        self.book = OpeningBook.from_config(cfg)
         self._build()
 
     def _build(self):
@@ -140,6 +144,16 @@ class SearchEngine:
 
     def analyze(self, board: chess.Board, think_seconds: float | None) -> MoveAnalysis:
         """Lance la recherche et renvoie un résumé complet (coup + éval + PV)."""
+        # Livre d'ouvertures : coup immédiat, sans MCTS ni GPU, tant qu'on est
+        # dans la théorie. `visit_counts` reste vide -> ces coups ne servent pas
+        # de cible d'apprentissage (on n'apprend pas du livre, on s'en sert).
+        if self.book is not None:
+            mv = self.book.lookup(board)
+            if mv is not None:
+                return MoveAnalysis(
+                    move=mv, move_san=board.san(mv), score=0.0, win=0.5,
+                    visits=0, pv_san=board.san(mv), top=[(board.san(mv), 0, 0.0)],
+                    step=self.step, from_book=True)
         nodes = 10_000_000 if think_seconds else self.default_nodes
         with self._lock:
             root = self.mcts.run(board, nodes, max_seconds=think_seconds)
@@ -649,6 +663,8 @@ class LichessBot:
         move = analysis.move
         if move is None:
             return
+        if analysis.from_book:
+            print(f"[partie {g.id}] livre : {analysis.move_san}")
 
         # Accepter une nulle proposée par l'adversaire si on n'est pas mieux.
         if self.accept_draw and self._opponent_offers_draw(state, g.my_color):

@@ -13,11 +13,17 @@ set -u
 cd "$(dirname "$0")/.." || exit 1
 
 # Verrou anti-double-instance : deux téléchargements du même mois écriraient des
-# shards en collision. On se ré-exécute une seule fois sous flock (échec immédiat
-# si un autre run, manuel ou service, tient déjà le verrou).
-if [[ -z "${_SANO1_DL_FLOCKED:-}" ]]; then
-  exec env _SANO1_DL_FLOCKED=1 flock -n /tmp/sano1-download.lock "$0" "$@"
+# shards en collision. Utilise un fichier PID portable (flock n'existe pas sur macOS).
+_LOCK=/tmp/sano1-download.lock
+if [[ -f "$_LOCK" ]]; then
+  _OLD_PID=$(<"$_LOCK")
+  if kill -0 "$_OLD_PID" 2>/dev/null; then
+    echo "Une instance tourne déjà (PID $_OLD_PID). Abandon." >&2
+    exit 1
+  fi
 fi
+echo $$ > "$_LOCK"
+trap 'rm -f "$_LOCK"' EXIT
 
 # Interpréteur du venv (zstandard/chess n'y sont QUE dans le venv).
 PY="$(pwd)/.venv/bin/python"; [[ -x "$PY" ]] || PY=python3

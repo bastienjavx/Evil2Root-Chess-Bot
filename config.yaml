@@ -22,6 +22,19 @@ mcts:
   dirichlet_eps: 0.0     # 0 en match (mettre ~0.25 pour exploration self-play)
   fpu: 0.2               # First Play Urgency (réduction pour fils non visités)
 
+# Livre d'ouvertures Polyglot (.bin) : joue la théorie en début de partie SANS
+# réentraîner le réseau. On consulte le livre pour les `max_ply` premiers
+# demi-coups ; dès qu'on en sort, c'est le MCTS qui reprend la main.
+# Construire un livre depuis nos PGN :  python -m sanchess.data.build_book ...
+# (ou déposer n'importe quel .bin Polyglot : gm2600, Perfect20xx, Cerebellum…)
+book:
+  enabled: false               # passer à true une fois `path` rempli
+  path: checkpoints/book.bin   # un seul livre ; ou utiliser `paths: [a.bin, b.bin]`
+  max_ply: 16                  # profondeur d'utilisation du livre (16 = 8 coups)
+  min_weight: 1                # ignore les coups du livre sous ce poids
+  selection: weighted          # "weighted" (varié) ou "best" (toujours le plus lourd)
+  temperature: 1.0             # >1 = plus de variété, <1 = plus déterministe
+
 train:
   device: auto           # "auto" (CUDA>MPS>CPU), "cuda", "mps" (Mac M1) ou "cpu"
   batch_size: 256        # 256 (et non 512) pour COHABITER avec le bot sur le

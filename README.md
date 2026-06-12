@@ -160,6 +160,31 @@ python -m sanchess.lichess_bot --check     # show account status (read-only)
 The collector feeds a replay buffer from live games while the trainer fine-tunes and refreshes
 `checkpoints/latest.pt`; the engine hot-reloads it between games.
 
+### 4b — Opening book (stronger openings, no retraining)
+
+A standard **Polyglot** opening book plays known theory for the first moves and only hands
+over to the MCTS once out of book — an instant strength boost for both the UCI engine and the
+Lichess bot, without touching the network's weights.
+
+```bash
+# Build a book from a Lichess PGN dump (local file or streamed URL):
+./scripts/build_book.sh data/lichess_raw/dump.pgn.zst --max-games 100000 --max-ply 24
+# -> writes checkpoints/book.bin
+```
+
+Then enable it in `config.yaml`:
+
+```yaml
+book:
+  enabled: true                # off by default
+  path: checkpoints/book.bin   # any standard Polyglot .bin works (gm2600, Perfect20xx…)
+  max_ply: 16                  # use the book for the first 16 half-moves
+  selection: weighted          # "weighted" (varied) or "best" (always the heaviest move)
+```
+
+Both `python -m sanchess.uci` and the Lichess bot consult the book automatically; book moves
+are **not** used as learning targets, so continuous training stays clean.
+
 ### 5 — Web console (API + live play + stats)
 
 A self-contained web UI (`sanchess.web`) to **play the model live**, watch it play **itself**,
@@ -202,6 +227,7 @@ sanchess/
 ├── encoding.py            8×8 planes + move ↔ index (4672) mapping
 ├── model.py               ResNet: policy (4672) & value (tanh) heads
 ├── uci.py                 UCI engine + weight hot-reload
+├── book.py                Polyglot opening book (theory before MCTS)
 ├── lichess_bot.py         native Lichess Bot API client
 ├── utils.py               config / checkpoints / .env loader
 ├── search/
@@ -209,6 +235,7 @@ sanchess/
 ├── data/
 │   ├── download.py        Lichess monthly dumps (.pgn.zst)
 │   ├── pgn_to_samples.py  PGN → shards (streamed, Elo-filtered)
+│   ├── build_book.py      PGN → Polyglot .bin opening book
 │   ├── stream.py          live Lichess games → replay buffer
 │   └── samples.py         shared sample format (gzip text)
 ├── train/
