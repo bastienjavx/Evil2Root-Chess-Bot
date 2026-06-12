@@ -141,21 +141,38 @@ class MCTS:
 
     # --- Recherche ------------------------------------------------------------
     def run(self, board: chess.Board, num_nodes: int,
-            max_seconds: float | None = None) -> _Node:
-        root = _Node(0.0)
-        root_priors, _ = self.ev.evaluate([board])[0]
-        self._expand(root, root_priors)
-        if not root.children:        # position terminale : aucun coup à chercher
-            return root
-        self._add_dirichlet(root)
+            max_seconds: float | None = None, *,
+            stop_event=None, root: "_Node | None" = None) -> _Node:
+        """Lance la recherche et renvoie la racine.
+
+        - `stop_event` (threading.Event) : si fourni, la recherche s'arrête
+          proprement dès qu'il est positionné (sert au pondering : on interrompt
+          la réflexion de fond dès que l'adversaire a joué pour son vrai coup).
+        - `root` : si fourni et déjà développé, on REPREND cet arbre au lieu d'en
+          repartir d'un neuf (ponder hit : on capitalise les visites déjà faites
+          pendant le tour de l'adversaire). Sinon on construit une racine fraîche.
+        """
+        if root is None or not root.expanded:
+            root = _Node(0.0)
+            root_priors, _ = self.ev.evaluate([board])[0]
+            self._expand(root, root_priors)
+            if not root.children:    # position terminale : aucun coup à chercher
+                return root
+            self._add_dirichlet(root)
+        # else : on reprend une racine déjà évaluée (ses stats N/W sont conservées).
 
         deadline = time.monotonic() + max_seconds if max_seconds else None
+        stopped = (lambda: stop_event is not None and stop_event.is_set())
         simulations = 0
-        while simulations < num_nodes and (deadline is None or time.monotonic() < deadline):
+        while (simulations < num_nodes
+               and (deadline is None or time.monotonic() < deadline)
+               and not stopped()):
             leaves = []          # (leaf_node, path, leaf_board)
             pending = set()
 
-            while len(leaves) < self.batch_size and simulations + len(leaves) < num_nodes:
+            while (len(leaves) < self.batch_size
+                   and simulations + len(leaves) < num_nodes
+                   and not stopped()):
                 node = root
                 path = [node]
                 b = board.copy()

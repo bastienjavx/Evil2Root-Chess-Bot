@@ -29,6 +29,7 @@ Usage :
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -68,6 +69,10 @@ class MoveAnalysis:
                           # (cible politique AlphaZero pour l'apprentissage sur
                           # les parties réelles du bot — cf. _record_game)
     from_book: bool = False  # coup tiré du livre d'ouvertures (pas du MCTS)
+    ponder_move: "chess.Move | None" = None  # réponse adverse jugée la plus
+                          # probable (2ᵉ ply de la PV) -> position à préparer en
+                          # arrière-plan pendant que l'adversaire réfléchit.
+    ponder_hit: bool = False  # ce coup a réutilisé un arbre calculé en ponder
 
     def eval_str(self) -> str:
         s = f"+{self.score:.2f}" if self.score >= 0 else f"{self.score:.2f}"
@@ -105,6 +110,31 @@ class SearchEngine:
         # Sérialise rechargement de poids et recherches : un seul GPU, et évite
         # de remplacer self.mcts pendant qu'un thread de partie l'utilise.
         self._lock = threading.Lock()
+        # Arbitrage du GPU : les VRAIES recherches (coups à jouer, rechargement)
+        # ont la priorité sur le pondering. `_real_waiters` compte les recherches
+        # réelles qui réclament le GPU ; le ponder cède dès qu'il est > 0. Permet
+        # le pondering même en MULTI-PARTIES (max_concurrent_games > 1) : une
+        # partie qui doit jouer ne patiente qu'une salve de ponder (~burst s) au
+        # lieu d'attendre toute la réflexion de fond.
+        self._gpu_cv = threading.Condition()
+        self._real_waiters = 0
+        # --- Pondering : réfléchir pendant le tour de l'adversaire -------------
+        # Après avoir joué, on lance en arrière-plan une recherche MCTS sur la
+        # position qui suivrait la réponse adverse jugée la plus probable. Si
+        # l'adversaire joue effectivement ce coup (ponder hit), on REPREND cet
+        # arbre déjà calculé au lieu de repartir de zéro (cf. analyze). Le ponder
+        # avance par SALVES courtes en relâchant le GPU entre chaque (cf.
+        # _ponder_worker) pour ne jamais bloquer une autre partie.
+        bcfg = cfg.get("bot", {})
+        self.ponder_enabled = bool(bcfg.get("ponder", True))
+        self.ponder_max_seconds = float(bcfg.get("ponder_max_seconds", 60.0))
+        self.ponder_burst_seconds = float(bcfg.get("ponder_burst_seconds", 0.25))
+        self._ponder_thread: "threading.Thread | None" = None
+        self._ponder_stop = threading.Event()
+        self._ponder_fen: "str | None" = None   # FEN en cours de pré-calcul
+        self._ponder_root = None                 # arbre MCTS résultant
+        self._ponder_mgmt_lock = threading.Lock()   # sérialise start/stop ponder
+        self._ponder_state_lock = threading.Lock()  # protège fen/root ci-dessus
         # Livre d'ouvertures (indépendant des poids -> chargé une seule fois).
         self.book = OpeningBook.from_config(cfg)
         self._build()
@@ -128,6 +158,23 @@ class SearchEngine:
             sys.stderr.write("[engine] AUCUN checkpoint -> réseau aléatoire (jeu faible)\n")
         self.mcts = MCTS(Evaluator(model, self.device), self.cfg)
 
+    @contextlib.contextmanager
+    def _gpu_for_real(self):
+        """Prend le GPU pour une VRAIE recherche, en priorité sur le pondering.
+        Signale qu'une recherche réelle attend (le ponder cède entre ses salves),
+        puis prend self._lock. À utiliser pour tout calcul dont dépend un coup."""
+        with self._gpu_cv:
+            self._real_waiters += 1
+            self._gpu_cv.notify_all()      # réveille un ponder en attente pour qu'il cède
+        self._lock.acquire()
+        try:
+            yield
+        finally:
+            self._lock.release()
+            with self._gpu_cv:
+                self._real_waiters -= 1
+                self._gpu_cv.notify_all()  # un ponder peut reprendre s'il ne reste personne
+
     def maybe_reload(self):
         # Ne JAMAIS laisser une erreur de rechargement remonter : sinon le thread
         # de la partie meurt et le bot « ne répond plus ». On garde les poids
@@ -137,13 +184,21 @@ class SearchEngine:
         try:
             m = self.ckpt_path.stat().st_mtime
             if m != self._mtime:
-                with self._lock:
+                # Stopper le ponder (son arbre vient des anciens poids) puis
+                # reconstruire en priorité GPU sur tout pondering résiduel.
+                self.stop_ponder()
+                with self._gpu_for_real():
                     self._build()
         except Exception as e:  # noqa: BLE001 — robustesse volontaire
             sys.stderr.write(f"[engine] rechargement ignoré ({e})\n")
 
     def analyze(self, board: chess.Board, think_seconds: float | None) -> MoveAnalysis:
         """Lance la recherche et renvoie un résumé complet (coup + éval + PV)."""
+        # Préempte tout pondering en cours : libère le GPU et récupère l'arbre
+        # déjà calculé. S'il porte EXACTEMENT sur la position courante, c'est un
+        # « ponder hit » : l'adversaire a joué le coup attendu, on reprend cet
+        # arbre au lieu de repartir de zéro.
+        pondered_fen, pondered_root = self.stop_ponder()
         # Livre d'ouvertures : coup immédiat, sans MCTS ni GPU, tant qu'on est
         # dans la théorie. `visit_counts` reste vide -> ces coups ne servent pas
         # de cible d'apprentissage (on n'apprend pas du livre, on s'en sert).
@@ -154,13 +209,84 @@ class SearchEngine:
                     move=mv, move_san=board.san(mv), score=0.0, win=0.5,
                     visits=0, pv_san=board.san(mv), top=[(board.san(mv), 0, 0.0)],
                     step=self.step, from_book=True)
+        reuse = (pondered_root is not None and pondered_fen == board.fen()
+                 and bool(pondered_root.children))
         nodes = 10_000_000 if think_seconds else self.default_nodes
-        with self._lock:
-            root = self.mcts.run(board, nodes, max_seconds=think_seconds)
-        return self._summarize(root, board)
+        with self._gpu_for_real():
+            root = self.mcts.run(board, nodes, max_seconds=think_seconds,
+                                 root=pondered_root if reuse else None)
+        return self._summarize(root, board, ponder_hit=reuse)
 
     def choose_move(self, board: chess.Board, think_seconds: float | None):
         return self.analyze(board, think_seconds).move
+
+    # --- Pondering -----------------------------------------------------------
+    def _halt_ponder(self):
+        """Arrête le thread de ponder courant et renvoie (fen, root) calculés.
+        À appeler SOUS self._ponder_mgmt_lock. Ne tient PAS _ponder_state_lock
+        pendant le join (le worker en a besoin pour publier son arbre)."""
+        t = self._ponder_thread
+        if t is not None:
+            self._ponder_stop.set()
+            t.join()
+            self._ponder_thread = None
+        with self._ponder_state_lock:
+            fen, root = self._ponder_fen, self._ponder_root
+            self._ponder_fen, self._ponder_root = None, None
+        return fen, root
+
+    def stop_ponder(self):
+        """Interrompt le pondering (si actif) et renvoie l'arbre déjà calculé."""
+        if not self.ponder_enabled:
+            return None, None
+        with self._ponder_mgmt_lock:
+            return self._halt_ponder()
+
+    def start_ponder(self, board: chess.Board):
+        """Lance en arrière-plan une recherche MCTS sur `board` (la position
+        attendue après la réponse adverse), jusqu'à interruption (stop_ponder)
+        ou plafond de temps. Jamais fatal."""
+        if not self.ponder_enabled or board.is_game_over():
+            return
+        with self._ponder_mgmt_lock:
+            self._halt_ponder()                  # un seul ponder à la fois
+            stop = threading.Event()
+            fen = board.fen()
+            with self._ponder_state_lock:
+                self._ponder_fen, self._ponder_root = fen, None
+            self._ponder_stop = stop
+            self._ponder_thread = threading.Thread(
+                target=self._ponder_worker, args=(board.copy(), fen, stop),
+                daemon=True)
+            self._ponder_thread.start()
+
+    def _ponder_worker(self, board: chess.Board, fen: str, stop: threading.Event):
+        """Étend l'arbre par SALVES courtes, en rendant le GPU entre chaque pour
+        laisser passer toute vraie recherche (coup à jouer d'une AUTRE partie).
+        L'arbre est republié après chaque salve -> exploitable même partiel pour
+        un ponder hit. S'arrête sur `stop` ou au plafond `ponder_max_seconds`."""
+        try:
+            root = None
+            deadline = time.monotonic() + self.ponder_max_seconds
+            while not stop.is_set() and time.monotonic() < deadline:
+                # Céder : tant qu'une vraie recherche réclame le GPU, on attend
+                # (on ne prend pas self._lock) -> elle n'attend jamais notre fin.
+                with self._gpu_cv:
+                    while self._real_waiters > 0 and not stop.is_set():
+                        self._gpu_cv.wait(timeout=0.5)
+                if stop.is_set():
+                    break
+                # Une salve bornée en temps, puis on relâche self._lock et on
+                # reteste la priorité (le GPU est rendu toutes les ~burst s).
+                with self._lock:
+                    root = self.mcts.run(board, 10_000_000,
+                                         max_seconds=self.ponder_burst_seconds,
+                                         stop_event=stop, root=root)
+                with self._ponder_state_lock:
+                    if self._ponder_fen == fen:  # toujours le ponder courant
+                        self._ponder_root = root
+        except Exception as e:  # noqa: BLE001 — le ponder ne doit jamais casser le bot
+            sys.stderr.write(f"[ponder] interrompu/échec ({e})\n")
 
     # --- Mise en forme de l'arbre de recherche -------------------------------
     @staticmethod
@@ -175,7 +301,17 @@ class SearchEngine:
             node = child
         return " ".join(sans)
 
-    def _summarize(self, root, board: chess.Board) -> MoveAnalysis:
+    @staticmethod
+    def _predicted_reply(root, best: chess.Move) -> "chess.Move | None":
+        """Coup adverse le plus visité APRÈS notre meilleur coup (2ᵉ ply de la
+        PV) : la position à préparer en ponder pendant le tour de l'adversaire."""
+        child = root.children.get(best)
+        if child is None or not child.children:
+            return None
+        mv, c = max(child.children.items(), key=lambda kv: kv[1].N)
+        return mv if c.N > 0 else None
+
+    def _summarize(self, root, board: chess.Board, ponder_hit: bool = False) -> MoveAnalysis:
         mv = best_move(root)
         if mv is None:                              # position terminale
             return MoveAnalysis(None, "—", 0.0, 0.5, root.N, "", [], self.step)
@@ -196,6 +332,8 @@ class SearchEngine:
             top=top,
             step=self.step,
             visit_counts=visit_counts,
+            ponder_move=self._predicted_reply(root, mv),
+            ponder_hit=ponder_hit,
         )
 
 
@@ -547,6 +685,7 @@ class LichessBot:
             print(f"[partie {game_id}] flux interrompu, reconnexion dans {backoff:.0f}s…")
             time.sleep(backoff)
             backoff = min(backoff * 2, 60.0)
+        self.engine.stop_ponder()    # libère le GPU si on ponderait pour cette partie
         self.games.pop(game_id, None)
 
     def _game_in_progress(self, game_id: str) -> bool:
@@ -683,6 +822,10 @@ class LichessBot:
             self._resign(g.id)
             return
 
+        if analysis.ponder_hit:
+            print(f"[partie {g.id}] ponder hit : {analysis.move_san} préparé "
+                  f"({analysis.visits} nœuds)")
+
         r = self._post(f"/api/bot/game/{g.id}/move/{move.uci()}")
         if r.status_code != 200:
             print(f"[partie {g.id}] coup refusé {move.uci()}: {r.status_code} {r.text}")
@@ -694,6 +837,28 @@ class LichessBot:
             if self.learn_from_games and analysis.visit_counts:
                 g.records.append((board.fen(), move.uci(),
                                   analysis.visit_counts, analysis.score))
+            # Pondering : on prépare déjà notre réponse au coup que l'on juge le
+            # plus probable de l'adversaire, pendant qu'il réfléchit. Sûr même en
+            # multi-parties : le ponder avance par salves et cède toujours le GPU
+            # à une vraie recherche (cf. _ponder_worker/_gpu_for_real). Un seul
+            # créneau de ponder à la fois -> c'est la dernière partie ayant joué
+            # qui ponder ; les autres préemptent dès qu'elles doivent jouer.
+            if self.engine.ponder_enabled and analysis.ponder_move is not None:
+                self._start_ponder_after(g, board, move, analysis.ponder_move)
+
+    def _start_ponder_after(self, g: _Game, board: chess.Board,
+                            move: chess.Move, ponder_move: chess.Move):
+        """Construit la position attendue après NOTRE coup puis la réponse adverse
+        présumée, et lance le pondering dessus. Jamais fatal."""
+        try:
+            pb = board.copy()
+            pb.push(move)
+            if ponder_move in pb.legal_moves:
+                pb.push(ponder_move)
+                if not pb.is_game_over():
+                    self.engine.start_ponder(pb)
+        except Exception as e:  # noqa: BLE001 — le ponder ne doit jamais casser la partie
+            print(f"[ponder {g.id}] non démarré: {e}")
 
     @staticmethod
     def _opponent_offers_draw(state, my_color) -> bool:
