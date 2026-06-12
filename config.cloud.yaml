@@ -1,0 +1,229 @@
+# Configuration San-o1 — PROFIL CLOUD (L40S / H100) ==========================
+# Snapshot dérivé de config.yaml, tuné pour entraîner VITE sur un gros GPU, puis
+# ramener le checkpoint tourner sur la RTX 2070S 8 Go locale.
+#
+# Usage sur la machine cloud :
+#   python -m sanchess.train.pretrain --config config.cloud.yaml
+#   (ou ./scripts/run_pretrain_cloud.sh)
+#
+# Seules les clés marquées « [cloud] » diffèrent de config.yaml. Le checkpoint
+# EMBARQUE son model_cfg (cf. build_model_from_checkpoint) : le bot/online/web
+# local reconstruisent automatiquement l'archi 24x320 au hot-reload, SANS qu'il
+# faille toucher au config.yaml local. (Mets quand même la même section `model`
+# dans config.yaml local si tu veux re-builder un réseau neuf à l'identique.)
+#
+# Archi choisie = 24x320, validée par scripts/bench_eval.py comme le plafond
+# encore jouable en blitz sur la 2070S (~4700 nœuds réels à 5 s). NE PAS monter
+# à 30x384/40x512 sans re-benchmarker : ça devient node-starved en temps-réel ici.
+# ===========================================================================
+
+model:
+  channels: 320          # [cloud] +1 cran vs 256 (sweet spot 2070S, cf. bench_eval)
+  blocks: 24             # [cloud] 24x320 ~47M params, ~1300 évals/s sur 2070S
+  se: true               # blocs Squeeze-Excitation (recalibrage par canal, +force)
+  se_ratio: 4            # ratio de réduction du MLP SE
+  policy_head: conv      # "conv" (tête politique convolutive style Lc0, +force) ou "flat" (FC legacy)
+  activation: mish       # "mish" (gain mesuré sur Lc0), "silu" ou "relu" (legacy)
+  value_hidden: 256      # largeur de la couche cachée de la tête valeur
+  value_channels: 32     # canaux de la conv 1x1 de la tête valeur (8 = legacy)
+  policy_size: 4672      # 64 cases x 73 types de coups (encodage AlphaZero) — NE PAS changer
+  value_head: wdl        # "scalar" (tanh, MSE) ou "wdl" (3 logits défaite/nulle/victoire,
+                         # cross-entropy ; le MCTS utilise E[résultat]=P(V)-P(D)). Changer
+                         # de tête = ré-entraîner (formes de poids différentes).
+
+mcts:
+  c_puct: 1.5
+  default_nodes: 800     # budget par défaut si la GUI ne donne ni temps ni nodes
+  eval_batch_size: 16    # feuilles évaluées par batch GPU
+  dirichlet_alpha: 0.3   # bruit racine (self-play uniquement)
+  dirichlet_eps: 0.0     # 0 en match (mettre ~0.25 pour exploration self-play)
+  fpu: 0.2               # First Play Urgency (réduction pour fils non visités)
+
+# Livre d'ouvertures Polyglot (.bin) : joue la théorie en début de partie SANS
+# réentraîner le réseau. On consulte le livre pour les `max_ply` premiers
+# demi-coups ; dès qu'on en sort, c'est le MCTS qui reprend la main.
+# Construire un livre depuis nos PGN :  python -m sanchess.data.build_book ...
+# (ou déposer n'importe quel .bin Polyglot : gm2600, Perfect20xx, Cerebellum…)
+book:
+  enabled: true                # passer à true une fois `path` rempli
+  path: checkpoints/book.bin   # un seul livre ; ou utiliser `paths: [a.bin, b.bin]`
+  max_ply: 16                  # profondeur d'utilisation du livre (16 = 8 coups)
+  min_weight: 1                # ignore les coups du livre sous ce poids
+  selection: weighted          # "weighted" (varié) ou "best" (toujours le plus lourd)
+  temperature: 1.0             # >1 = plus de variété, <1 = plus déterministe
+
+train:
+  device: cuda           # [cloud] GPU dédié, pas de cohabitation bureau/bot
+  batch_size: 1024       # [cloud] le GPU local OOMait à 512 ; sur L40S 48Go /
+                         # H100 80Go, 1024 tient large. H100 : pousse à 2048-4096
+                         # (mets aussi num_workers 24+ pour ne pas affamer le GPU).
+  lr: 0.002              # [cloud] linear scaling rule : batch 256->1024 (4x) =>
+                         # LR ~x2 (prudent vs x4 pour rester stable en AMP).
+  weight_decay: 0.0001
+  value_loss_weight: 1.0
+  amp: true              # mixed precision fp16 (CUDA). L40S/H100 gèrent aussi le
+                         # bf16 (plus stable, sans GradScaler) -- code = fp16 par
+                         # défaut, suffisant ici ; bf16 = évolution optionnelle.
+  pretrain_steps: 1000000
+  checkpoint_every: 2000 # le wall-clock chute (gros GPU) : 2000 reste fréquent
+  log_every: 50
+  num_workers: 16        # [cloud] gros CPU cloud : alimente le GPU à batch 1024
+  grad_clip: 1.0         # clip de la norme des gradients (0 = désactivé)
+  label_smoothing: 0.02  # lissage de la cible politique (régularisation)
+  warmup_steps: 4000     # [cloud] warmup allongé (LR + batch plus gros)
+  lr_schedule: cosine    # "cosine" (warmup + décroissance) ou "none"
+  ema_decay: 0.0         # EMA des poids (ex. 0.999) ; 0 = désactivé
+
+online:
+  lr: 0.0001             # LR faible -> limite l'oubli catastrophique
+  batch_size: 256
+  step_every_sec: 2.0    # cadence des pas de gradient
+  checkpoint_every_sec: 60
+  buffer_capacity: 500000  # taille du replay buffer glissant (samples)
+  min_buffer: 5000       # attendre ce nb de samples avant de s'entraîner
+
+data:
+  raw_dir: data/lichess_raw
+  buffer_dir: data/replay_buffer
+  shards_dir: data/shards
+  min_elo: 2000          # filtre qualité: Elo moyen minimum des parties
+  exclude_bullet: true   # ignorer le bullet (bruyant)
+  exclude_no_eval: false # garder même sans eval Stockfish
+  # Garde-fou OOM : plafond de samples chargés en RAM par le pretrain (les shards
+  # sont mélangés avant troncature -> échantillon représentatif de tous les mois).
+  # ~64 o/sample (buffer brut) => 100 M ≈ 7 Go, stable quel que soit num_workers
+  # (cf. ShardDataset : buffer contigu, plus de copy-on-write qui dérive en RAM).
+  # Mettre null pour tout charger (risque OOM si le dataset dépasse la RAM).
+  max_train_samples: 300000000  # [cloud] ~19 Go RAM : OK sur instance L40S/H100
+                                # (souvent 90-240 Go RAM). Monte/null selon `free -h`.
+
+paths:
+  checkpoint_dir: checkpoints
+  latest: checkpoints/latest.pt
+
+# Self-play CPU (data generation) tournant EN PARALLÈLE de l'entraînement GPU.
+# Le CPU joue des parties via MCTS et écrit des shards dans data/replay_buffer ;
+# online.py les ingère. Aucune synchro bloquante -> le GPU n'attend pas le CPU.
+# Cf. `python -m sanchess.train.selfplay` et `scripts/run_selfplay.sh`.
+# Garde-fous CPU (cette machine a déjà figé) : workers + threads bornés, nice bas.
+selfplay:
+  device: cpu            # cpu = laisse tout le GPU à l'entraînement
+  workers: 4             # parties en parallèle (≈ 1 cœur/worker ; <12 = marge bureau)
+  threads_per_worker: 1  # threads torch par worker (1 -> 1 cœur, évite la sur-souscription)
+  nice: 10               # priorité basse : ne peut pas étrangler le bureau
+  mem_limit_mb: 2048     # plafond RAM DUR par worker (Mo). Anti-freeze : au-delà le
+                         # worker lève MemoryError et meurt seul au lieu de saturer le
+                         # swap et figer le PC. Total ≈ workers × mem_limit_mb (ici ~8 Go
+                         # pour 4 workers). 0 = illimité. À ajuster selon `free -h`.
+  nodes: 160             # simulations MCTS/coup (↓ = parties plus rapides, ↑ = meilleures)
+  max_plies: 250         # coupe les parties interminables
+  temp_moves: 20         # 1ers coups échantillonnés (diversité d'ouvertures)
+  temperature: 1.0       # température d'échantillonnage sur les visites
+  dirichlet_eps: 0.25    # bruit racine (exploration ; 0 en match)
+  dirichlet_alpha: 0.3
+  flush_games: 4         # écrit un shard tous les N parties
+
+# Entraînement distribué multi-appareils (data-parallel synchrone).
+# Conçu pour un cluster HÉTÉROGÈNE Mac M1 (MPS) + Linux (CUDA/CPU) : chaque nœud
+# calcule en local, les gradients sont moyennés via gloo (CPU) -> cross-platform.
+# Cf. `python -m sanchess.train.distributed` et `scripts/run_distributed.sh`.
+distributed:
+  backend: nccl          # [cloud] multi-GPU sur une même instance (8x H100) = nccl.
+                         # (gloo seulement pour le cluster hétérogène Mac+Linux local.)
+  master_addr: 192.168.0.166 # IP LAN du rang 0 (cette machine Linux = master)
+  master_port: 29500     # port de rendez-vous (doit être ouvert sur le master)
+  timeout_sec: 1800      # délai d'attente d'initialisation du groupe
+
+lichess:
+  # Token optionnel (var d'env LICHESS_TOKEN prioritaire). Respecter la ToS Lichess.
+  tv_channel: best       # flux TV utilisé par stream.py
+  request_timeout: 30
+
+bot:
+  accept_variants: [standard]   # variantes de défis acceptées
+  think_divisor: 30             # temps de réflexion ~ temps_restant / divisor.
+                                # 40 était trop prudent : le bot finissait des
+                                # blitz avec >1 min inutilisée tout en gaffant.
+                                # Budget = remaining/divisor -> décroît tout seul,
+                                # ne flag pas. 30 utilise mieux la pendule.
+  max_think_seconds: 10.0       # plafond par coup. NE PAS baisser : mesuré, il
+                                # faut ~5000 nœuds (~5-7 s) pour voir les tactiques
+                                # à 2-3 coups ; à 3500 nœuds (5 s) il gaffe encore.
+                                # 10 s -> ~7000 nœuds. Le MCTS étant 6x plus rapide,
+                                # « plus vite » doit donner PLUS de nœuds, pas moins
+                                # de temps.
+  # Pondering : réfléchir pendant le tour de l'adversaire. Après avoir joué, le
+  # bot lance une recherche MCTS de fond sur la position qui suivrait la réponse
+  # adverse la plus probable (2ᵉ ply de sa variante). Si l'adversaire joue
+  # effectivement ce coup (« ponder hit »), le bot REPREND cet arbre déjà calculé
+  # au lieu de repartir de zéro -> il joue plus fort à temps égal. Fonctionne
+  # aussi en MULTI-PARTIES : la réflexion de fond avance par salves courtes et
+  # cède TOUJOURS le GPU à une vraie recherche (une partie qui doit jouer attend
+  # au pire une salve). Un seul ponder à la fois (la dernière partie ayant joué).
+  # Met le GPU à contribution pendant le tour adverse : peut ralentir un
+  # entraînement (online/pretrain) qui tourne en même temps. false pour désactiver.
+  ponder: true
+  ponder_max_seconds: 60         # plafond de la réflexion de fond (sécurité si
+                                 # l'adversaire est absent : le ponder se termine
+                                 # tout seul au lieu de tenir le GPU indéfiniment)
+  ponder_burst_seconds: 0.25     # durée d'une salve de ponder avant de rendre le
+                                 # GPU et retester la priorité. Plus petit = une
+                                 # vraie recherche patiente moins, mais un peu plus
+                                 # de surcoût (réacquisition du verrou/GPU).
+  # Timeout de LECTURE des flux Lichess (event + partie), en secondes. Sans lui
+  # (None), iter_lines() bloque pour toujours si la connexion TCP meurt en
+  # silence (demi-ouverte : NAT/routeur/Lichess qui drop sans FIN) -> le bot gèle
+  # pendant le tour de l'adversaire (il est en attente de lecture) et ne rejoue
+  # jamais. Lichess émet un keepalive ~6 s ; 30 s ne coupe donc jamais une
+  # connexion vivante mais détecte une connexion morte -> reconnexion auto.
+  stream_read_timeout_sec: 30
+  # Défi automatique d'autres bots Lichess (pour jouer/s'entraîner en continu)
+  challenge_bots: false           # active l'envoi périodique de défis à d'autres bots
+  challenge_interval_sec: 60     # fréquence de tentative d'envoi
+  challenge_cooldown_sec: 600    # délai mini avant de re-défier le même bot
+  challenge_429_backoff_sec: 120 # pause après un 429 (rate-limit Lichess) : insister
+                                 # réarme le compteur, donc on attend que ça se libère
+  max_concurrent_games: 4        # plafond de parties simultanées (temps-réel : éviter le flag)
+  challenge_rated: true          # parties CLASSÉES par défaut (surchargeable par mode)
+  # Cadences proposées aux autres bots : UNE est tirée au hasard à chaque défi.
+  # -> évite le tout-correspondance, varie blitz lent / rapide / classique / corr.
+  # clock_limit ET clock_increment en SECONDES ; days = correspondance (sans pendule).
+  # `rated` est optionnel par mode (sinon = challenge_rated). Pas de bullet (trop rapide).
+  challenge_modes:
+    - { clock_limit: 300,  clock_increment: 3 }    # blitz 5+3
+    - { clock_limit: 600,  clock_increment: 5 }    # rapide 10+5
+    - { clock_limit: 900,  clock_increment: 10 }   # rapide 15+10
+    - { clock_limit: 1800, clock_increment: 20 }   # classique 30+20
+    - { days: 3 }                                  # correspondance 3j/coup
+  # --- Repli si challenge_modes est absent/vide (ancien réglage unique) ---------
+  challenge_correspondence: true # défis en CORRESPONDANCE (par jours, sans pendule)
+  challenge_days: 3              # jours par coup (valeurs Lichess: 1,2,3,5,7,10,14)
+  challenge_clock_limit: 300     # (ignoré quand challenge_correspondence: true)
+  challenge_clock_increment: 3   # (ignoré quand challenge_correspondence: true)
+  # Apprentissage RL : le bot apprend de SES PROPRES parties (victoires ET
+  # défaites). Chaque partie terminée est écrite dans data/replay_buffer au
+  # format AlphaZero (valeur = résultat réel, politique = visites MCTS) et
+  # ingérée par train/online.py -> les poids s'améliorent sur ses vraies erreurs.
+  # Boucle complète : jouer -> enregistrer -> entraîner (online) -> recharger à
+  # chaud de meilleurs poids -> rejouer mieux. Désactiver = false.
+  learn_from_games: true
+  # Sur-échantillonnage des GAFFES (« apprendre de ses erreurs » au sens fort) :
+  # une position est marquée « erreur » si l'éval du bot s'effondre à son coup
+  # suivant (chute >= learn_blunder_threshold) OU s'il a JETÉ UN GAIN (il se
+  # croyait nettement gagnant, éval >= 0.5, mais n'a pas gagné). Ces positions
+  # sont écrites learn_blunder_weight fois dans le shard -> le replay buffer les
+  # tire d'autant plus souvent (pas de changement de format : priorisation par
+  # répétition). 1 = désactivé (toutes les positions à poids égal).
+  learn_blunder_weight: 3        # nb de copies d'une position gaffée (1 = off)
+  learn_blunder_threshold: 0.30  # chute d'éval (POV bot, [-1,1]) qui marque une gaffe
+  # Chat dans la partie : salutations + commandes (!help, !eval, !pv, !top, !info, !rating, !fen…)
+  chat_enabled: true             # répond aux commandes et salue au début/à la fin
+  greeting: "Bonjour {opp} ! Je suis un réseau de neurones maison. Bonne partie — tape !help pour les commandes."
+  goodbye: "gg {opp}, merci pour la partie !"
+  # Nulle / abandon automatiques (courtoisie + ne pas traîner une partie perdue)
+  accept_draw: true              # accepte une nulle proposée si on n'est pas mieux
+  accept_draw_score: -0.50       # éval (point de vue du bot) en dessous de laquelle on accepte
+  resign_enabled: false          # abandonner automatiquement les positions désespérées
+  resign_score: -0.97            # éval sous laquelle un coup compte comme « perdu »
+  resign_streak: 4               # nb de coups perdus d'affilée avant d'abandonner
+  resign_min_move: 12            # n'abandonne pas avant ce numéro de coup (évite l'ouverture)
