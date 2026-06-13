@@ -90,3 +90,81 @@ recopie la section `model:` de `config.cloud.yaml` dans `config.yaml` local.
   ensuite EN LOCAL gratuitement (le cloud ne sert qu'à l'amorçage fort).
 - **VRAM locale** : 24x320 ~0,4 Go en éval, aucun risque sur 8 Go même avec
   bot + online + bureau.
+
+---
+
+# 5. Aller BEAUCOUP plus fort : la boucle RL self-play (cloud)
+
+Le pretrain supervisé plafonne près de l'**imitation du fort humain** (Lichess
+Elo≥2000) : c'est un mur de **données**, pas de compute. Pour dépasser ce plafond,
+on enchaîne sur une **boucle RL self-play** (style AlphaZero) amorcée sur le réseau
+supervisé. C'est là que le GPU cloud paie vraiment : il faut générer BEAUCOUP de
+parties à haut nombre de nœuds.
+
+```
+   selfplay_gpu  ──écrit──>  data/replay_buffer  ──ingéré par──>  online.py
+        ▲                                                            │
+        └────────── hot-reload checkpoints/latest.pt ◄──────────────┘
+```
+
+Le `selfplay_gpu` joue **des centaines de parties EN PARALLÈLE** et regroupe toutes
+les évaluations réseau dans **un seul forward GPU par tour** (parallélisation de
+feuilles inter-parties). Sur L40S/H100 il produit des dizaines de fois plus de
+parties/s que le self-play CPU — c'est ce débit qui fait progresser le réseau.
+
+```bash
+# Tout-en-un (trainer online + générateur self-play GPU, après le pretrain) :
+./scripts/run_rl_cloud.sh
+
+# Ou séparément, pour régler le débit :
+GAMES=512 NODES=400 ./scripts/run_selfplay_gpu.sh   # sature la VRAM (cf. config)
+./scripts/online_after_pretrain.sh                   # le trainer ingère le buffer
+```
+
+Réglages dans la section `selfplay_gpu:` de `config.cloud.yaml` :
+
+| Clé | L40S 48 Go | H100 80 Go | Effet |
+|---|---|---|---|
+| `games` | 384–512 | 768–1024 | parties parallèles (= taille du batch GPU) |
+| `leaves_per_game` | 8 | 8 | batch effectif ≈ `games × leaves_per_game` |
+| `nodes` | 300–600 | 400–800 | qualité des cibles π (force RL) vs vitesse |
+
+> Surveille `nvidia-smi` : si util GPU < 90 %, le goulot est l'encodage CPU des
+> positions (`encode_board`) — augmente `games` ou lance le générateur sur une
+> instance CPU costaude séparée qui écrit dans le même `data/replay_buffer`.
+
+Le format de samples est **identique** au reste du pipeline (`fen, coup, valeur,
+π=visites`) : `online.py` l'ingère sans modification (la distribution de visites π
+est déjà la cible politique via `dense_policy_target`). On rapatrie `latest.pt`
+comme au §3 ; le bot le recharge à chaud.
+
+# 6. Convertir le réseau en force RÉELLE sur la 2070S
+
+En blitz, l'Elo ≈ **nœuds/coup** ≈ débit d'éval. Deux accélérateurs, gratuits ou
+presque, déjà intégrés :
+
+**Réutilisation d'arbre** (`mcts.tree_reuse: true`, défaut) — entre deux coups, on
+reprend le sous-arbre déjà calculé (notre coup + réponse adverse) au lieu de
+repartir de zéro. Rien à faire, c'est actif partout (UCI, bot, web). Invalidé
+automatiquement au hot-reload des poids.
+
+**Moteur TensorRT fp16** — sur Turing, ~2-3× le débit d'éval -> ~2× de nœuds.
+À compiler **sur la 2070S** (un moteur TRT est spécifique au GPU/driver, pas
+transférable depuis le cloud) :
+
+```bash
+# Option A — TorchScript+TensorRT (le plus simple, branché tel quel) :
+python -m sanchess.export --ckpt checkpoints/latest.pt --trt checkpoints/sano1.ts --fp16
+# puis dans config.yaml :  model.trt_engine: checkpoints/sano1.ts
+
+# Option B — ONNX + trtexec (si tu préfères onnxruntime-gpu / un .plan natif) :
+python -m sanchess.export --ckpt checkpoints/latest.pt --onnx checkpoints/sano1.onnx
+# la commande trtexec exacte est affichée par l'export.
+
+# Re-mesurer le gain de débit :
+.venv/bin/python scripts/bench_eval.py --sizes 24x320
+```
+
+Repli automatique sur PyTorch si `torch_tensorrt`/le fichier sont absents : aucune
+régression possible. **Recompiler le moteur à chaque changement d'archi** (un
+moteur 20x256 ne convient pas à un 24x320).

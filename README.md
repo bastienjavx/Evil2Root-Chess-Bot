@@ -278,6 +278,19 @@ All knobs live in [`config.yaml`](config.yaml):
 To avoid two trainers fighting over `latest.pt`, run online learning **after** pre-training
 finishes (see `scripts/online_after_pretrain.sh`).
 
+4. **Self-play RL (cloud)** — to push *past* the human-data ceiling, bootstrap an
+   AlphaZero-style self-play loop on the pre-trained net. `sanchess.train.selfplay_gpu`
+   plays **hundreds of games in parallel**, batching every leaf evaluation into one GPU
+   forward, and feeds the replay buffer while `online.py` trains and refreshes `latest.pt`
+   (hot-reloaded by the generator). One command: `scripts/run_rl_cloud.sh`. Full guide in
+   [CLOUD.md](CLOUD.md) (§5).
+
+**Turning a stronger net into real strength on the RTX 2070S** — in blitz, Elo ≈ nodes/move
+≈ eval throughput. Two accelerators ship in-tree: **tree reuse** between moves
+(`mcts.tree_reuse`, on by default — the subtree is carried over instead of rebuilt) and an
+optional **TensorRT fp16 engine** (`python -m sanchess.export --trt … --fp16`, ~2-3× eval
+throughput on Turing, falls back to PyTorch if absent). See [CLOUD.md](CLOUD.md) (§6).
+
 ## Distributed training (Mac M1 + Linux)
 
 Train the same network across several machines at once — for example a **Linux box
@@ -327,11 +340,13 @@ estimate rating and track progress across checkpoints.
 - [x] Squeeze-Excitation residual blocks
 - [x] Distributed multi-device training (Mac M1 + Linux)
 - [x] Apple Silicon (MPS) support
+- [x] WDL (win/draw/loss) value head
+- [x] Tree reuse between moves (subtree carried over, `mcts.tree_reuse`)
+- [x] ONNX / TensorRT export for faster MCTS inference (`sanchess.export`)
+- [x] GPU-batched self-play for cloud RL (`sanchess.train.selfplay_gpu`)
+- [x] Self-play reinforcement learning on top of the supervised base (see [CLOUD.md](CLOUD.md))
 - [ ] Larger network (e.g. 20×384) and more training data
-- [ ] WDL (win/draw/loss) value head
-- [ ] Self-play reinforcement learning on top of the supervised base
-- [ ] Transposition table / tree reuse between moves
-- [ ] ONNX / TensorRT export for faster MCTS inference
+- [ ] Transposition table (cross-branch node sharing)
 
 ## Disclaimer
 

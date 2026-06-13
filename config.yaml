@@ -112,6 +112,21 @@ selfplay:
   dirichlet_alpha: 0.3
   flush_games: 4         # écrit un shard tous les N parties
 
+# Self-play BATCHÉ GPU (sanchess.train.selfplay_gpu) : joue `games` parties en
+# parallèle et regroupe toutes les évaluations dans UN forward GPU par tour. C'est
+# le générateur de données de la boucle RL ; sur gros GPU cloud il produit des
+# dizaines de fois plus de parties/s que le self-play CPU. Voir config.cloud.yaml
+# pour les réglages L40S/H100. Valeurs locales modestes (cohabite avec le reste).
+selfplay_gpu:
+  device: cuda           # cuda recommandé (tout l'intérêt est le batch GPU)
+  games: 128             # parties parallèles (2070S 8Go : 128-256 selon l'archi)
+  leaves_per_game: 8     # feuilles/partie/tour -> batch GPU ≈ games × 8
+  nodes: 300             # simulations MCTS par coup
+  max_plies: 300
+  flush_games: 32        # un shard tous les N parties terminées
+  max_games: 0           # 0 = infini
+  seed: 0
+
 # Entraînement distribué multi-appareils (data-parallel synchrone).
 # Conçu pour un cluster HÉTÉROGÈNE Mac M1 (MPS) + Linux (CUDA/CPU) : chaque nœud
 # calcule en local, les gradients sont moyennés via gloo (CPU) -> cross-platform.
