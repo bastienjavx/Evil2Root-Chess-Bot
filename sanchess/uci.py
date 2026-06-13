@@ -15,6 +15,7 @@ import chess
 import torch
 
 from .book import OpeningBook
+from .export import make_inference_model
 from .model import build_model, build_model_from_checkpoint
 from .search.mcts import MCTS, Evaluator, best_move
 from .utils import (load_checkpoint, load_config, load_model_state,
@@ -32,7 +33,12 @@ class Engine:
         self._ckpt_mtime = None
         self.board = chess.Board()
         self.default_nodes = cfg.get("mcts", {}).get("default_nodes", 800)
+        self.tree_reuse = bool(cfg.get("mcts", {}).get("tree_reuse", True))
         self.book = OpeningBook.from_config(cfg)
+        # Arbre MCTS de la recherche précédente, réutilisé entre coups successifs
+        # (réponse adverse + notre coup) : on capitalise les visites déjà faites.
+        self._prev_root = None
+        self._prev_board = None
         self._build_engine()
 
     def _build_engine(self):
@@ -47,7 +53,14 @@ class Engine:
             model = build_model(self.cfg)
             sys.stderr.write("info string AUCUN checkpoint -> réseau aléatoire "
                              "(jeu faible, normal avant entraînement)\n")
+        model = make_inference_model(self.cfg, model, self.device)
         self.mcts = MCTS(Evaluator(model, self.device), self.cfg)
+
+    def _reset_tree(self):
+        """Oublie l'arbre réutilisable (nouvelle partie ou nouveaux poids :
+        l'arbre vient d'un autre réseau/contexte, il ne doit pas être repris)."""
+        self._prev_root = None
+        self._prev_board = None
 
     def maybe_reload(self):
         """Recharge les poids si le checkpoint a changé (hot-reload)."""
@@ -55,6 +68,7 @@ class Engine:
             mtime = self.ckpt_path.stat().st_mtime
             if mtime != self._ckpt_mtime:
                 self._build_engine()
+                self._reset_tree()             # arbre invalidé par les nouveaux poids
 
     def set_position(self, tokens: list[str]):
         if tokens[0] == "startpos":
@@ -103,7 +117,15 @@ class Engine:
         num_nodes = nodes if nodes is not None else (
             10_000_000 if max_seconds is not None else self.default_nodes)
 
-        root = self.mcts.run(self.board, num_nodes, max_seconds=max_seconds)
+        # Réutilisation d'arbre : si la position courante descend (≤2 demi-coups)
+        # de la recherche précédente, on reprend ce sous-arbre comme racine.
+        reuse = None
+        if self.tree_reuse and self._prev_root is not None:
+            reuse = self.mcts.advance_root(self._prev_root, self._prev_board, self.board)
+        root = self.mcts.run(self.board, num_nodes, max_seconds=max_seconds, root=reuse)
+        if self.tree_reuse:
+            self._prev_root = root
+            self._prev_board = self.board.copy(stack=False)
         mv = best_move(root)
         if mv is None:
             return "bestmove (none)"
@@ -135,6 +157,7 @@ def main():
         elif cmd == "ucinewgame":
             engine.maybe_reload()
             engine.board = chess.Board()
+            engine._reset_tree()           # nouvelle partie : arbre précédent caduc
         elif cmd == "position":
             engine.set_position(parts[1:])
         elif cmd == "go":

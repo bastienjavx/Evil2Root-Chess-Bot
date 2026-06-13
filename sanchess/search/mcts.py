@@ -34,6 +34,31 @@ class _Node:
         return self.W / self.N if self.N > 0 else 0.0
 
 
+def select_child(node: "_Node", c_puct: float, fpu: float):
+    """Sélection PUCT d'un fils (fonction libre, partagée par le MCTS séquentiel
+    et le self-play batché GPU pour garantir une sélection IDENTIQUE).
+
+    Q est exprimé du point de vue du PARENT (= -Q(fils)). Les pertes virtuelles
+    (`vloss`) en vol comptent comme des défaites vues du parent -> découragent de
+    re-descendre le même chemin, ce qui REMPLIT le lot GPU au lieu de le vider.
+    """
+    total = node.N + node.vloss
+    sqrt_n = math.sqrt(total) if total > 0 else 1.0
+    fpu_base = node.q() - fpu          # valeur optimiste d'un fils non visité
+    best_score, best = -1e9, None
+    for move, child in node.children.items():
+        n_eff = child.N + child.vloss
+        if n_eff > 0:
+            q = -(child.W + child.vloss) / n_eff
+        else:
+            q = fpu_base
+        u = c_puct * child.prior * sqrt_n / (1 + n_eff)
+        score = q + u
+        if score > best_score:
+            best_score, best = score, (move, child)
+    return best
+
+
 class Evaluator:
     """Encapsule le réseau pour évaluer un lot de positions."""
 
@@ -102,28 +127,7 @@ class MCTS:
 
     # --- Sélection PUCT -------------------------------------------------------
     def _select_child(self, node: _Node) -> tuple[chess.Move, _Node]:
-        total = node.N + node.vloss
-        sqrt_n = math.sqrt(total) if total > 0 else 1.0
-        # FPU : un fils non encore visité vaut ~ la valeur du parent (côté parent =
-        # node.q()) diminuée de `fpu`. Base PROPRE (sans pertes virtuelles) pour ne
-        # pas biaiser l'exploration quand un chemin est en vol dans le lot GPU.
-        fpu_base = node.q() - self.fpu
-        best_score, best = -1e9, None
-        for move, child in node.children.items():
-            n_eff = child.N + child.vloss
-            if n_eff > 0:
-                # Q du point de vue du parent = -Q(fils). Chaque perte virtuelle
-                # compte comme une victoire du fils (donc une perte vue du parent)
-                # -> décourage de re-descendre le même chemin, ce qui REMPLIT le lot
-                # GPU (sinon le batch se vide à 1 feuille et la recherche rampe).
-                q = -(child.W + child.vloss) / n_eff
-            else:
-                q = fpu_base
-            u = self.c_puct * child.prior * sqrt_n / (1 + n_eff)
-            score = q + u
-            if score > best_score:
-                best_score, best = score, (move, child)
-        return best
+        return select_child(node, self.c_puct, self.fpu)
 
     def _expand(self, node: _Node, priors: dict):
         for move, p in priors.items():
@@ -138,6 +142,40 @@ class MCTS:
         for move, n in zip(moves, noise):
             c = root.children[move]
             c.prior = (1 - self.dir_eps) * c.prior + self.dir_eps * n
+
+    # --- Réutilisation d'arbre entre coups ------------------------------------
+    def advance_root(self, root: "_Node | None", board_before: chess.Board,
+                     board_after: chess.Board, max_depth: int = 2) -> "_Node | None":
+        """Retrouve, dans l'arbre `root` calculé à `board_before`, le sous-arbre
+        correspondant à la position `board_after` (atteinte en `max_depth` demi-coups
+        au plus : notre coup + la réponse adverse). Le renvoie pour servir de
+        racine à la recherche suivante -> on capitalise les visites déjà faites,
+        au lieu de repartir d'un arbre vide (gain de force GRATUIT à temps égal).
+
+        Renvoie None si l'arbre est absent/non développé ou si la position cible
+        n'a pas été explorée (on repartira alors d'une racine fraîche). On compare
+        l'EPD (FEN sans compteurs) pour tolérer les transpositions de compteurs
+        tout en garantissant une position strictement identique.
+        """
+        if root is None or not root.expanded:
+            return None
+        target = board_after._transposition_key()
+        # DFS borné sur les fils RÉELLEMENT visités (les autres n'ont pas de stats
+        # à réutiliser). Profondeur 0 = board_before lui-même (cas sans coup joué).
+        stack = [(root, board_before, 0)]
+        while stack:
+            node, b, depth = stack.pop()
+            if b._transposition_key() == target:
+                return node if node.expanded else None
+            if depth >= max_depth:
+                continue
+            for move, child in node.children.items():
+                if child.N == 0 and not child.expanded:
+                    continue                      # fils jamais visité : rien à reprendre
+                nb = b.copy(stack=False)
+                nb.push(move)
+                stack.append((child, nb, depth + 1))
+        return None
 
     # --- Recherche ------------------------------------------------------------
     def run(self, board: chess.Board, num_nodes: int,
