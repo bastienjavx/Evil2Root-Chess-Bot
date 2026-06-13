@@ -47,6 +47,7 @@ import torch
 
 from .book import OpeningBook
 from .data.samples import write_samples
+from .export import make_inference_model
 from .model import build_model, build_model_from_checkpoint
 from .search.mcts import MCTS, Evaluator, best_move
 from .utils import load_checkpoint, load_config, load_dotenv, load_model_state, resolve_device
@@ -163,6 +164,7 @@ class SearchEngine:
             model = build_model(self.cfg)
             self.step = None
             sys.stderr.write("[engine] AUCUN checkpoint -> réseau aléatoire (jeu faible)\n")
+        model = make_inference_model(self.cfg, model, self.device)
         self.mcts = MCTS(Evaluator(model, self.device), self.cfg)
 
     @contextlib.contextmanager

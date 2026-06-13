@@ -19,6 +19,7 @@ from pathlib import Path
 import chess
 import torch
 
+from ..export import make_inference_model
 from ..model import build_model, build_model_from_checkpoint
 from ..search.mcts import MCTS, Evaluator, best_move
 from ..utils import (load_checkpoint, load_config, load_model_state,
@@ -125,6 +126,7 @@ class EngineManager:
         else:  # aucun checkpoint : réseau aléatoire (jeu faible mais fonctionnel)
             model = build_model(self.cfg)
             step, model_cfg, mtime = 0, self.cfg.get("model", {}), 0.0
+        model = make_inference_model(self.cfg, model, self.device)
         mcts = MCTS(Evaluator(model, self.device), self.cfg)
         return _ModelEntry(mcts, mtime, step, model_cfg)
 

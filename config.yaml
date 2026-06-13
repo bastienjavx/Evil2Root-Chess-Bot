@@ -10,6 +10,11 @@ model:
   value_hidden: 256      # largeur de la couche cachée de la tête valeur
   value_channels: 32     # canaux de la conv 1x1 de la tête valeur (8 = legacy)
   policy_size: 4672      # 64 cases x 73 types de coups (encodage AlphaZero) — NE PAS changer
+  # Moteur TensorRT optionnel (inférence ~2-3x plus rapide sur la 2070S Turing ->
+  # plus de nœuds MCTS à temps fixe -> +Elo). Le compiler SUR la 2070S cible :
+  #   python -m sanchess.export --ckpt checkpoints/latest.pt --trt checkpoints/sano1.ts --fp16
+  # puis renseigner le chemin ci-dessous. Repli automatique sur PyTorch si absent.
+  # trt_engine: checkpoints/sano1.ts
   value_head: wdl        # "scalar" (tanh, MSE) ou "wdl" (3 logits défaite/nulle/victoire,
                          # cross-entropy ; le MCTS utilise E[résultat]=P(V)-P(D)). Changer
                          # de tête = ré-entraîner (formes de poids différentes).

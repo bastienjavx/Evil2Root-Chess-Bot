@@ -15,6 +15,7 @@ import chess
 import torch
 
 from .book import OpeningBook
+from .export import make_inference_model
 from .model import build_model, build_model_from_checkpoint
 from .search.mcts import MCTS, Evaluator, best_move
 from .utils import (load_checkpoint, load_config, load_model_state,
@@ -52,6 +53,7 @@ class Engine:
             model = build_model(self.cfg)
             sys.stderr.write("info string AUCUN checkpoint -> réseau aléatoire "
                              "(jeu faible, normal avant entraînement)\n")
+        model = make_inference_model(self.cfg, model, self.device)
         self.mcts = MCTS(Evaluator(model, self.device), self.cfg)
 
     def _reset_tree(self):
