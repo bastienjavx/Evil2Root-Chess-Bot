@@ -21,6 +21,10 @@ mcts:
   dirichlet_alpha: 0.3   # bruit racine (self-play uniquement)
   dirichlet_eps: 0.0     # 0 en match (mettre ~0.25 pour exploration self-play)
   fpu: 0.2               # First Play Urgency (réduction pour fils non visités)
+  tree_reuse: true       # réutiliser le sous-arbre MCTS entre coups successifs
+                         # (notre coup + réponse adverse) au lieu de repartir d'un
+                         # arbre vide -> plus de nœuds effectifs à temps égal, gain
+                         # de force gratuit. Invalidé au hot-reload (nouveaux poids).
 
 # Livre d'ouvertures Polyglot (.bin) : joue la théorie en début de partie SANS
 # réentraîner le réseau. On consulte le livre pour les `max_ply` premiers

@@ -137,6 +137,13 @@ class SearchEngine:
         self._ponder_state_lock = threading.Lock()  # protège fen/root ci-dessus
         # Livre d'ouvertures (indépendant des poids -> chargé une seule fois).
         self.book = OpeningBook.from_config(cfg)
+        # Réutilisation d'arbre HORS ponder : on garde l'arbre de notre dernière
+        # vraie recherche ; au coup suivant, si la position courante en descend
+        # (notre coup + la réponse adverse), on reprend ce sous-arbre. Couvre les
+        # ponder-miss (l'adversaire n'a pas joué le coup prévu) et le cas ponder off.
+        self.tree_reuse = bool(bcfg.get("tree_reuse", True))
+        self._last_real_root = None
+        self._last_real_board: "chess.Board | None" = None
         self._build()
 
     def _build(self):
@@ -189,6 +196,9 @@ class SearchEngine:
                 self.stop_ponder()
                 with self._gpu_for_real():
                     self._build()
+                # Les nouveaux poids invalident l'arbre conservé entre coups.
+                self._last_real_root = None
+                self._last_real_board = None
         except Exception as e:  # noqa: BLE001 — robustesse volontaire
             sys.stderr.write(f"[engine] rechargement ignoré ({e})\n")
 
@@ -211,10 +221,19 @@ class SearchEngine:
                     step=self.step, from_book=True)
         reuse = (pondered_root is not None and pondered_fen == board.fen()
                  and bool(pondered_root.children))
+        start_root = pondered_root if reuse else None
+        # Ponder-miss (ou ponder off) : on tente de récupérer le sous-arbre depuis
+        # NOTRE dernière vraie recherche (notre coup + la réponse adverse réelle).
+        if start_root is None and self.tree_reuse and self._last_real_root is not None:
+            start_root = self.mcts.advance_root(
+                self._last_real_root, self._last_real_board, board)
         nodes = 10_000_000 if think_seconds else self.default_nodes
         with self._gpu_for_real():
             root = self.mcts.run(board, nodes, max_seconds=think_seconds,
-                                 root=pondered_root if reuse else None)
+                                 root=start_root)
+        if self.tree_reuse:
+            self._last_real_root = root
+            self._last_real_board = board.copy(stack=False)
         return self._summarize(root, board, ponder_hit=reuse)
 
     def choose_move(self, board: chess.Board, think_seconds: float | None):

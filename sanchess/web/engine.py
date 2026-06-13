@@ -35,13 +35,19 @@ def value_to_winprob(v: float) -> float:
 
 
 class _ModelEntry:
-    __slots__ = ("mcts", "mtime", "step", "model_cfg")
+    __slots__ = ("mcts", "mtime", "step", "model_cfg", "last_root", "last_board")
 
     def __init__(self, mcts, mtime, step, model_cfg):
         self.mcts = mcts
         self.mtime = mtime
         self.step = step
         self.model_cfg = model_cfg
+        # Réutilisation d'arbre entre coups consécutifs d'une même partie (onglets
+        # Jouer / Regarder) : la dernière recherche et sa position. `advance_root`
+        # valide la position exacte -> une analyse d'une position sans lien repart
+        # simplement d'un arbre frais (aucune réutilisation erronée possible).
+        self.last_root = None
+        self.last_board = None
 
 
 class EngineManager:
@@ -51,6 +57,7 @@ class EngineManager:
         self.ckpt_dir = Path(self.cfg["paths"]["checkpoint_dir"])
         self.latest_path = Path(self.cfg["paths"]["latest"])
         self.default_nodes = self.cfg.get("mcts", {}).get("default_nodes", 800)
+        self.tree_reuse = bool(self.cfg.get("mcts", {}).get("tree_reuse", True))
         self._cache: dict[str, _ModelEntry] = {}
         self._locks: dict[str, threading.Lock] = {}
         self._cache_lock = threading.Lock()
@@ -145,7 +152,13 @@ class EngineManager:
         num_nodes = nodes if nodes else (10_000_000 if movetime else self.default_nodes)
         t0 = time.time()
         with lock:
-            root = mcts.run(board, num_nodes, max_seconds=movetime)
+            reuse = None
+            if self.tree_reuse and entry.last_root is not None:
+                reuse = mcts.advance_root(entry.last_root, entry.last_board, board)
+            root = mcts.run(board, num_nodes, max_seconds=movetime, root=reuse)
+            if self.tree_reuse:
+                entry.last_root = root
+                entry.last_board = board.copy(stack=False)
         elapsed = time.time() - t0
 
         bm = best_move(root)
