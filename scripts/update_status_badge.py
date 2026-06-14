@@ -57,6 +57,33 @@ def _short_gpu(name: str) -> str:
     return name
 
 
+def _checkpoint_progress() -> tuple[int | None, int | None]:
+    """(step, total) du pretrain depuis latest.pt (mmap, ~instantané) + config.
+
+    Source faisant foi : le log stdout du pretrain est block-bufferisé et le
+    symlink `*_latest.log` peut être périmé (cf. monitor_train.py). Le step réel
+    est celui écrit dans le checkpoint tous les `checkpoint_every` steps.
+    """
+    latest = ROOT / "checkpoints" / "latest.pt"
+    total = None
+    try:
+        import yaml
+        cfg = yaml.safe_load((ROOT / "config.yaml").read_text())
+        latest = ROOT / cfg.get("paths", {}).get("latest", "checkpoints/latest.pt")
+        total = int(cfg.get("train", {}).get("pretrain_steps", 0)) or None
+    except Exception:
+        pass
+    if not latest.exists():
+        return None, total
+    try:
+        import torch
+        ck = torch.load(str(latest), map_location="cpu",
+                        weights_only=False, mmap=True)
+        return int(ck.get("step", 0)), total
+    except Exception:  # checkpoint en cours d'écriture / torch absent
+        return None, total
+
+
 def build_badges(stats) -> dict[str, dict]:
     svc = {s["name"]: s for s in stats.services_status()}
     summary = stats.training_summary()
@@ -77,9 +104,16 @@ def build_badges(stats) -> dict[str, dict]:
     selfplay_running = _proc("train.selfplay")  # couvre selfplay et selfplay_gpu
 
     # --- badge training ---
-    if pretrain_running and "pretrain" in summary:
-        p = summary["pretrain"]
-        msg = f"pretrain · step {_fmt_step(p['step'])} · pol {p['policy']:.2f}"
+    if pretrain_running:
+        step, total = _checkpoint_progress()  # step réel (checkpoint fait foi)
+        if step is None and "pretrain" in summary:
+            step = summary["pretrain"]["step"]  # repli log si checkpoint illisible
+        if step is not None and total:
+            msg = f"pretrain · {_fmt_step(step)}/{_fmt_step(total)} ({100*step/total:.1f}%)"
+        elif step is not None:
+            msg = f"pretrain · step {_fmt_step(step)}"
+        else:
+            msg = "pretrain · starting…"
         color = "brightgreen"
     elif online_running and "online" in summary:
         o = summary["online"]
