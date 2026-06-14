@@ -27,6 +27,8 @@ Usage :
 from __future__ import annotations
 
 import argparse
+import contextlib
+import gc
 import os
 import time
 from pathlib import Path
@@ -95,6 +97,53 @@ def play_game(mcts: MCTS, nodes: int, max_plies: int,
 
 # --- Worker -------------------------------------------------------------------
 
+def _checkpoint_load_floor_mb(path: Path) -> int:
+    """RAM virtuelle minimale pour dézipper un gros checkpoint PyTorch.
+
+    `latest.pt` peut embarquer l'état AdamW en plus des poids. Sous un RLIMIT_AS
+    trop bas, `torch.load` échoue dans miniz avec un faux air de corruption.
+    """
+    try:
+        size_mb = path.stat().st_size / (1024 * 1024)
+    except OSError:
+        return 0
+    return int(size_mb * 6 + 1024)
+
+
+@contextlib.contextmanager
+def _temporary_memory_floor(floor_mb: int):
+    """Relève temporairement RLIMIT_AS si le plafond courant est trop bas."""
+    if floor_mb <= 0 or resource is None:
+        yield
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        wanted = int(floor_mb) * 1024 * 1024
+        if hard != resource.RLIM_INFINITY:
+            wanted = min(wanted, hard)
+        if soft != resource.RLIM_INFINITY and soft < wanted:
+            resource.setrlimit(resource.RLIMIT_AS, (wanted, hard))
+            try:
+                yield
+            finally:
+                resource.setrlimit(resource.RLIMIT_AS, (soft, hard))
+            return
+    except (ValueError, OSError):
+        pass
+    yield
+
+
+def _load_checkpoint_for_play(path: Path, device):
+    with _temporary_memory_floor(_checkpoint_load_floor_mb(path)):
+        return load_checkpoint(path, device)
+
+
+def _warm_runtime_before_mem_limit() -> None:
+    """Force les imports natifs paresseux avant de poser RLIMIT_AS."""
+    np.random.dirichlet([1.0, 1.0])
+    np.random.choice(1)
+
+
 def _maybe_reload(model, latest: Path, mtime, device):
     """Recharge les poids si latest.pt a changé. Retourne le nouveau mtime."""
     if not latest.exists():
@@ -102,8 +151,10 @@ def _maybe_reload(model, latest: Path, mtime, device):
     try:
         m = latest.stat().st_mtime
         if m != mtime:
-            ck = load_checkpoint(latest, device)
+            ck = _load_checkpoint_for_play(latest, device)
             load_model_state(model, ck.get("raw_state", ck["model_state"]))
+            del ck
+            gc.collect()
             return m
     except (OSError, KeyError, RuntimeError):
         pass                                       # checkpoint en cours d'écriture
@@ -127,7 +178,6 @@ def _limit_memory(mem_limit_mb: int) -> None:
 
 def run_worker(wid: int, cfg: dict, device: str, args):
     s = _scfg(cfg)
-    _limit_memory(int(args.mem_limit_mb))              # plafond RAM/worker (anti-freeze)
     torch.set_num_threads(max(1, int(args.threads)))   # ne pas saturer les cœurs
     try:
         os.nice(int(args.nice))                        # priorité basse (anti-freeze)
@@ -141,13 +191,17 @@ def run_worker(wid: int, cfg: dict, device: str, args):
     # polluerait le replay buffer.
     latest = Path(cfg["paths"]["latest"])
     if latest.exists():
-        ck = load_checkpoint(latest, device)
+        ck = _load_checkpoint_for_play(latest, device)
         model = build_model_from_checkpoint(ck, fallback_cfg=cfg)
         load_model_state(model, ck.get("raw_state", ck["model_state"]))
+        del ck
+        gc.collect()
         mtime = latest.stat().st_mtime          # déjà à jour : pas de reload immédiat
     else:
         model = build_model(cfg)
         mtime = None
+    _warm_runtime_before_mem_limit()
+    _limit_memory(int(args.mem_limit_mb))              # plafond RAM/worker (anti-freeze)
     ev = Evaluator(model, device)
     mcts = MCTS(ev, cfg)
     mcts.dir_eps = float(args.dirichlet_eps)           # bruit racine pour explorer
