@@ -1,0 +1,16 @@
+# Garde l'image du coordinateur minuscule : rien d'inutile/lourd ne part dans le build.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+checkpoints/
+data/
+scripts/
+tests/
+docs/
+*.log
+*.pt
+*.ts
+*.bin
+.env

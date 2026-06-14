@@ -1,0 +1,19 @@
+# Image du COORDINATEUR de cluster San-o1 (Railway). Torch-free -> légère & rapide.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Dépendances d'abord (cache Docker) : on n'installe QUE le coordinateur.
+COPY requirements-cluster.txt .
+RUN pip install --no-cache-dir -r requirements-cluster.txt
+
+# Code : le paquet sanchess (sanchess/__init__.py est vide -> aucun import torch au chargement
+# de sanchess.cluster.server ; les modules train/*.py présents ne sont jamais importés ici).
+COPY sanchess ./sanchess
+
+# Volume Railway monté ici (modèle + buffer de parties + sqlite). Persistant entre déploiements.
+ENV POOL_DIR=/data
+EXPOSE 8000
+
+# Railway fournit $PORT. uvicorn sert l'app FastAPI du coordinateur.
+CMD ["sh", "-c", "uvicorn sanchess.cluster.server:app --host 0.0.0.0 --port ${PORT:-8000}"]

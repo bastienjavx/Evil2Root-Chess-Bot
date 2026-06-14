@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>San-o1 · Cluster de calcul distribué</title>
+  <link rel="stylesheet" href="/cluster/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>♟ San-o1 — Cluster de calcul distribué</h1>
+    <p class="tagline">Apporte ta puissance (CPU · GPU NVIDIA · Mac M1) pour entraîner le réseau de neurones en continu.</p>
+  </header>
+
+  <main>
+    <section class="cards">
+      <div class="card"><div class="num" id="model-version">—</div><div class="lbl">Version du modèle</div></div>
+      <div class="card"><div class="num" id="model-step">—</div><div class="lbl">Steps d'entraînement</div></div>
+      <div class="card"><div class="num" id="total-games">—</div><div class="lbl">Parties contribuées</div></div>
+      <div class="card"><div class="num" id="total-samples">—</div><div class="lbl">Positions générées</div></div>
+      <div class="card"><div class="num" id="active-workers">—</div><div class="lbl">Workers actifs</div></div>
+      <div class="card"><div class="num" id="games-min">—</div><div class="lbl">Parties / min</div></div>
+    </section>
+
+    <section class="join">
+      <h2>Rejoindre le cluster</h2>
+      <p>Installe le client, puis lance un worker. Il détecte automatiquement ton matériel (CUDA / MPS / CPU) :</p>
+      <pre id="join-cmd"><code># 1. récupérer San-o1 + installer
+git clone &lt;repo San-o1&gt; &amp;&amp; cd San-o1
+pip install -r requirements.txt
+
+# 2. lancer un worker (remplace TonPseudo)
+python -m sanchess.cluster.worker --server <span id="server-url">SERVER_URL</span> --name "TonPseudo"</code></pre>
+      <button id="copy-btn">Copier la commande</button>
+      <p class="hint">Le worker télécharge le modèle courant, joue des parties contre lui-même (self-play MCTS) et renvoie les données. Plus il y a de monde, plus le réseau apprend vite.</p>
+    </section>
+
+    <section class="board">
+      <h2>Leaderboard</h2>
+      <table id="leaderboard">
+        <thead><tr><th>#</th><th>Contributeur</th><th>Matériel</th><th>Parties</th><th>Positions</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <p class="status" id="status">Connexion…</p>
+  </main>
+
+  <script src="/cluster/static/app.js"></script>
+</body>
+</html>
