@@ -152,8 +152,13 @@ def main():
     ap.add_argument("--seed-shards", default=None,
                     help="shards de pretrain pour amorcer le buffer (anti-oubli)")
     ap.add_argument("--config", default=None)
+    ap.add_argument("--batch-size", type=int, default=None,
+                    help="surcharge online.batch_size (ex. 128 pour tenir sur un GPU 8 Go)")
     args = ap.parse_args()
-    run(load_config(args.config), args.seed_shards)
+    cfg = load_config(args.config)
+    if args.batch_size:
+        cfg["online"]["batch_size"] = args.batch_size
+    run(cfg, args.seed_shards)
 
 
 if __name__ == "__main__":

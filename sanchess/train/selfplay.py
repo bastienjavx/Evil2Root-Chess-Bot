@@ -42,7 +42,7 @@ import torch
 import torch.multiprocessing as mp
 
 from ..data.samples import write_samples
-from ..model import build_model
+from ..model import build_model, build_model_from_checkpoint
 from ..search.mcts import MCTS, Evaluator
 from ..utils import (load_checkpoint, load_config, load_model_state,
                      resolve_device)
@@ -134,14 +134,25 @@ def run_worker(wid: int, cfg: dict, device: str, args):
     except (OSError, AttributeError):
         pass
 
-    model = build_model(cfg)
+    # On RESPECTE l'archi enregistrée dans le checkpoint (comme online.py/uci.py)
+    # plutôt que le config.yaml local : sinon un checkpoint 24x320 chargé dans un
+    # réseau 256x20 (config local) verrait TOUS ses poids écartés (formes
+    # incompatibles, strict=False) -> self-play avec un réseau ALÉATOIRE qui
+    # polluerait le replay buffer.
+    latest = Path(cfg["paths"]["latest"])
+    if latest.exists():
+        ck = load_checkpoint(latest, device)
+        model = build_model_from_checkpoint(ck, fallback_cfg=cfg)
+        load_model_state(model, ck.get("raw_state", ck["model_state"]))
+        mtime = latest.stat().st_mtime          # déjà à jour : pas de reload immédiat
+    else:
+        model = build_model(cfg)
+        mtime = None
     ev = Evaluator(model, device)
     mcts = MCTS(ev, cfg)
     mcts.dir_eps = float(args.dirichlet_eps)           # bruit racine pour explorer
     mcts.dir_alpha = float(s.get("dirichlet_alpha", mcts.dir_alpha))
 
-    latest = Path(cfg["paths"]["latest"])
-    mtime = None
     buffer_dir = Path(cfg["data"]["buffer_dir"])
     buffer_dir.mkdir(parents=True, exist_ok=True)
 
