@@ -362,12 +362,22 @@ def main() -> None:
     ap.add_argument("--max-games", type=int, default=int(s.get("max_games", 0)),
                     dest="max_games", help="arrêter après ce nb de parties (0 = infini)")
     ap.add_argument("--seed", type=int, default=int(s.get("seed", 0)))
+    ap.add_argument("--compile", action="store_true",
+                    default=bool(s.get("compile", False)),
+                    help="torch.compile l'évaluateur (reduce-overhead)")
     args = ap.parse_args()
 
     device = resolve_device(args.device or cfg.get("train", {}).get("device", "auto"))
     search_cfg = _build_search_cfg(cfg, args)
 
     model = build_model(cfg)
+    if args.compile:
+        try:
+            import torch
+            model = torch.compile(model, mode="reduce-overhead")
+            print("[selfplay_gpu] torch.compile activé (reduce-overhead)", flush=True)
+        except Exception as e:
+            print(f"[selfplay_gpu] torch.compile ignoré : {e}", flush=True)
     ev = Evaluator(model, device)
     latest = Path(cfg["paths"]["latest"])
     mtime = _maybe_reload(model, latest, None, device)

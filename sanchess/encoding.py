@@ -144,7 +144,10 @@ def encode_board(board: chess.Board) -> np.ndarray:
     for square, piece in board.piece_map().items():
         csq = _canon_square(square, turn)
         r, f = divmod(csq, 8)
-        ptype_idx = _PIECE_TYPES.index(piece.piece_type)
+        # python-chess : PAWN..KING == 1..6 -> index 0..5 sans recherche linéaire
+        # (l'ancien _PIECE_TYPES.index() scannait la liste pour chaque pièce de
+        # chaque position : pur surcoût Python sur le hot-path du self-play batché).
+        ptype_idx = piece.piece_type - 1
         ours = piece.color == turn
         plane = ptype_idx + (0 if ours else 6)
         planes[plane, r, f] = 1.0
