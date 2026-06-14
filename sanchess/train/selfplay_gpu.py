@@ -108,7 +108,11 @@ class _Game:
             path = [node]
             b = self.board.copy(stack=False)
             while node.expanded and not node.terminal:
-                move, node = select_child(node, self.c_puct, self.fpu)
+                sel = select_child(node, self.c_puct, self.fpu)
+                if sel is None:                  # noeud développé sans fils légal
+                    node.terminal = True         # -> traité comme feuille terminale
+                    break
+                move, node = sel
                 b.push(move)
                 path.append(node)
 
