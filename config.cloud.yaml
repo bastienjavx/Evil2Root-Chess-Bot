@@ -38,8 +38,6 @@ mcts:
   dirichlet_alpha: 0.3   # bruit racine (self-play uniquement)
   dirichlet_eps: 0.0     # 0 en match (mettre ~0.25 pour exploration self-play)
   fpu: 0.2               # First Play Urgency (réduction pour fils non visités)
-  tree_reuse: true       # réutiliser le sous-arbre MCTS entre coups successifs
-                         # (notre coup + réponse adverse) -> gain de force gratuit.
 
 # Livre d'ouvertures Polyglot (.bin) : joue la théorie en début de partie SANS
 # réentraîner le réseau. On consulte le livre pour les `max_ply` premiers
@@ -56,23 +54,35 @@ book:
 
 train:
   device: cuda           # [cloud] GPU dédié, pas de cohabitation bureau/bot
-  batch_size: 1024       # [cloud] le GPU local OOMait à 512 ; sur L40S 48Go /
-                         # H100 80Go, 1024 tient large. H100 : pousse à 2048-4096
-                         # (mets aussi num_workers 24+ pour ne pas affamer le GPU).
-  lr: 0.002              # [cloud] linear scaling rule : batch 256->1024 (4x) =>
-                         # LR ~x2 (prudent vs x4 pour rester stable en AMP).
+  batch_size: 2048       # [L40S] 46 Go VRAM : batch 1024 n'utilisait que 19 % VRAM
+                         # -> 2048 monte à ~38 % et double le throughput samples/s.
+                         # H100 80 Go : pousser à 4096 + num_workers 12+.
+  lr: 0.003              # [L40S] sqrt-scaling : batch 1024->2048 (×2) → LR ×√2
+                         # ≈ 0.0028 arrondi à 0.003 (prudent pour stabilité AMP).
   weight_decay: 0.0001
   value_loss_weight: 1.0
-  amp: true              # mixed precision fp16 (CUDA). L40S/H100 gèrent aussi le
-                         # bf16 (plus stable, sans GradScaler) -- code = fp16 par
-                         # défaut, suffisant ici ; bf16 = évolution optionnelle.
-  pretrain_steps: 1000000
-  checkpoint_every: 2000 # le wall-clock chute (gros GPU) : 2000 reste fréquent
+  amp: true              # mixed precision CUDA
+  amp_dtype: bf16        # [L40S] bf16 natif sur Ada Lovelace (compute cap 8.9) :
+                         # même vitesse que fp16 mais plage dynamique suffisante
+                         # -> pas de GradScaler, pas d'overflow, entraînement plus stable.
+  compile: true          # torch.compile (reduce-overhead) : +15-30 % throughput sur
+                         # formes fixes (conv 8×8 invariables). 1er batch = warmup JIT.
+  prefetch_factor: 4     # buffers DataLoader pré-remplis pour supprimer les micro-stalls
+                         # entre deux batchs GPU (défaut PyTorch = 2).
+  pretrain_steps: 5000000   # [cloud] 5× plus long : dataset ~25M samples →
+                         # ~200 passes (normal pour ce type d'apprentissage).
+                         # À step 90k on est à seulement 1.8 % du parcours.
+  checkpoint_every: 2000
   log_every: 50
-  num_workers: 16        # [cloud] gros CPU cloud : alimente le GPU à batch 1024
+  num_workers: 6         # [L40S] 8 cœurs physiques AMD EPYC. Avec 16 workers on avait
+                         # 2 process/cœur -> context-switching pur. 6 workers = 1 cœur
+                         # dédié/worker + 2 cœurs libres pour le process principal + OS.
+                         # (Le DataLoader n'était pas le goulot : GPU à 94 % compute.)
   grad_clip: 1.0         # clip de la norme des gradients (0 = désactivé)
   label_smoothing: 0.02  # lissage de la cible politique (régularisation)
-  warmup_steps: 4000     # [cloud] warmup allongé (LR + batch plus gros)
+  warmup_steps: 5000     # [L40S] LR plus haut (0.003) -> warmup un peu plus long pour
+                         # éviter les à-coups en début d'entraînement (couverture ≈ 10 M
+                         # samples à batch 2048, identique à 4000 steps × batch 1024).
   lr_schedule: cosine    # "cosine" (warmup + décroissance) ou "none"
   ema_decay: 0.0         # EMA des poids (ex. 0.999) ; 0 = désactivé
 
@@ -103,6 +113,23 @@ paths:
   checkpoint_dir: checkpoints
   latest: checkpoints/latest.pt
 
+# Self-play BATCHÉ GPU : joue N parties en parallèle avec un seul forward GPU par
+# tour -> throughput ~10-50× supérieur à selfplay CPU. À lancer sur la machine cloud.
+# Cf. `python -m sanchess.train.selfplay_gpu` et `scripts/run_selfplay_gpu.sh`.
+selfplay_gpu:
+  device: cuda            # [cloud] GPU dédié (selfplay hérite cpu, cette section écrase)
+  games: 256              # parties en parallèle — NE PAS monter >512 : Python MCTS est
+                          # single-thread, le ratio GPU/CPU est FIXE quel que soit games.
+                          # Plus de games = plus de travail Python, pas de gain GPU.
+  nodes: 200              # simulations MCTS par coup (↑ = parties plus fortes mais plus lentes)
+  leaves_per_game: 8      # feuilles collectées par partie avant le batch GPU
+  flush_games: 32         # écrit un shard tous les N parties
+  max_plies: 250          # coupe les parties interminables
+  temp_moves: 20          # 1ers coups échantillonnés (diversité d'ouvertures)
+  temperature: 1.0
+  dirichlet_eps: 0.25
+  dirichlet_alpha: 0.3
+
 # Self-play CPU (data generation) tournant EN PARALLÈLE de l'entraînement GPU.
 # Le CPU joue des parties via MCTS et écrit des shards dans data/replay_buffer ;
 # online.py les ingère. Aucune synchro bloquante -> le GPU n'attend pas le CPU.
@@ -124,24 +151,6 @@ selfplay:
   dirichlet_eps: 0.25    # bruit racine (exploration ; 0 en match)
   dirichlet_alpha: 0.3
   flush_games: 4         # écrit un shard tous les N parties
-
-# Self-play BATCHÉ GPU (sanchess.train.selfplay_gpu) : LE générateur de données
-# pour la boucle RL cloud. Joue `games` parties EN PARALLÈLE dans un seul process
-# et regroupe toutes les évaluations réseau dans UN forward GPU par tour -> le GPU
-# tourne à plein (≠ self-play CPU qui l'affame). Hérite des clés `selfplay`
-# ci-dessus (temp_moves, temperature, dirichlet…) ; surcharge ce qui suit.
-# Batch GPU effectif ≈ games × leaves_per_game : viser la pleine VRAM du GPU.
-selfplay_gpu:
-  device: cuda
-  games: 512             # [cloud] parties parallèles. L40S 48Go : 384-512 ;
-                         # H100 80Go : 768-1024. Monter jusqu'à saturer la VRAM.
-  leaves_per_game: 8     # feuilles/partie/tour. batch ≈ games×8 (512 -> ~4096).
-  nodes: 400             # simulations MCTS/coup. Plus haut = cibles π de meilleure
-                         # qualité (RL plus fort) mais parties plus lentes. 300-800.
-  max_plies: 300
-  flush_games: 64        # écrit un shard tous les N parties terminées
-  max_games: 0           # 0 = tourne indéfiniment (boucle RL continue)
-  seed: 0
 
 # Entraînement distribué multi-appareils (data-parallel synchrone).
 # Conçu pour un cluster HÉTÉROGÈNE Mac M1 (MPS) + Linux (CUDA/CPU) : chaque nœud
