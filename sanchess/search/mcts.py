@@ -41,20 +41,31 @@ def select_child(node: "_Node", c_puct: float, fpu: float):
     Q est exprimé du point de vue du PARENT (= -Q(fils)). Les pertes virtuelles
     (`vloss`) en vol comptent comme des défaites vues du parent -> découragent de
     re-descendre le même chemin, ce qui REMPLIT le lot GPU au lieu de le vider.
+
+    Renvoie None UNIQUEMENT si le noeud n'a aucun fils (position sans coup légal :
+    l'appelant doit alors traiter ce noeud comme terminal). Un noeud développé a
+    toujours des fils -> on garantit de renvoyer un (move, child) même si tous les
+    scores sont non finis (priors/valeurs NaN d'un checkpoint en cours d'écriture
+    ou divergé) : on conserve un repli plutôt que de planter à l'unpack.
     """
+    if not node.children:
+        return None
     total = node.N + node.vloss
     sqrt_n = math.sqrt(total) if total > 0 else 1.0
     fpu_base = node.q() - fpu          # valeur optimiste d'un fils non visité
-    best_score, best = -1e9, None
+    best_score, best = -math.inf, None
     for move, child in node.children.items():
         n_eff = child.N + child.vloss
         if n_eff > 0:
             q = -(child.W + child.vloss) / n_eff
         else:
             q = fpu_base
-        u = c_puct * child.prior * sqrt_n / (1 + n_eff)
+        prior = child.prior if math.isfinite(child.prior) else 0.0
+        u = c_puct * prior * sqrt_n / (1 + n_eff)
         score = q + u
-        if score > best_score:
+        if not math.isfinite(score):
+            score = -math.inf       # NaN/inf : repli (les fils sains gagnent)
+        if best is None or score > best_score:
             best_score, best = score, (move, child)
     return best
 
@@ -80,7 +91,11 @@ class Evaluator:
         with torch.autocast(device_type="cuda" if use_cuda else "cpu",
                             enabled=use_cuda):
             logits, values = self.model(t)
-        logits = logits.float().cpu().numpy()
+        # Un checkpoint en cours d'écriture / divergé peut sortir des NaN/inf :
+        # on les neutralise ici (logits -> 0 => priors uniformes, value -> 0)
+        # pour que le self-play continue au lieu de propager des NaN dans l'arbre.
+        logits = np.nan_to_num(logits.float().cpu().numpy(), nan=0.0,
+                               posinf=0.0, neginf=0.0)
         # Tête WDL (B,3) -> scalaire E[résultat] = P(victoire) - P(défaite) ∈ [-1,1].
         # Tête scalaire (B,1) -> tel quel. (Détection par la forme : robuste.)
         if values.dim() == 2 and values.shape[1] == 3:
@@ -88,6 +103,7 @@ class Evaluator:
             values = p[:, 2] - p[:, 0]
         else:
             values = values.float().cpu().numpy().reshape(-1)
+        values = np.nan_to_num(values, nan=0.0, posinf=1.0, neginf=-1.0)
 
         out = []
         for i, board in enumerate(boards):
@@ -216,7 +232,11 @@ class MCTS:
                 b = board.copy()
                 # Descente PUCT jusqu'à une feuille (non expandée ou terminale).
                 while node.expanded and not node.terminal:
-                    move, node = self._select_child(node)
+                    sel = self._select_child(node)
+                    if sel is None:              # noeud développé sans fils légal
+                        node.terminal = True     # -> feuille terminale
+                        break
+                    move, node = sel
                     b.push(move)
                     path.append(node)
 
