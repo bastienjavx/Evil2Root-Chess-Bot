@@ -73,6 +73,9 @@ train:
                          # ~200 passes (normal pour ce type d'apprentissage).
                          # À step 90k on est à seulement 1.8 % du parcours.
   checkpoint_every: 2000
+  keep_last_checkpoints: 20  # [cloud] rotation : ne garde que les N derniers
+                             # step_*.pt (~0.5 Go pièce). Sans ça, checkpoints/
+                             # atteint ~85 Go. 0 = tout garder.
   log_every: 50
   num_workers: 6         # [L40S] 8 cœurs physiques AMD EPYC. Avec 16 workers on avait
                          # 2 process/cœur -> context-switching pur. 6 workers = 1 cœur
@@ -89,7 +92,17 @@ train:
 online:
   lr: 0.0001             # LR faible -> limite l'oubli catastrophique
   batch_size: 256
-  step_every_sec: 2.0    # cadence des pas de gradient
+  step_every_sec: 1.0    # [cloud] cadence des pas de gradient. Sur H100 un pas
+                         # (forward+backward batch 256) prend ~20 ms : à 2.0 s le
+                         # trainer dormait 99 % du temps. On descend à 1.0 s -> 2×
+                         # plus de pas/h. NE PAS descendre plus bas à l'aveugle : le
+                         # vrai garde-fou n'est pas le GPU mais le RATIO DE REPLAY
+                         # (samples consommés / samples générés par le self-play).
+                         # consommation = batch_size / step_every_sec = 256/s ici.
+                         # Si le buffer cesse de grandir (le self-play ne suit plus),
+                         # on repasse sur les mêmes samples -> sur-apprentissage du
+                         # buffer + oubli. Surveille `buffer=` dans les logs online :
+                         # tant qu'il monte vers buffer_capacity, tu peux accélérer.
   checkpoint_every_sec: 60
   buffer_capacity: 500000  # taille du replay buffer glissant (samples)
   min_buffer: 5000       # attendre ce nb de samples avant de s'entraîner
@@ -118,9 +131,13 @@ paths:
 # Cf. `python -m sanchess.train.selfplay_gpu` et `scripts/run_selfplay_gpu.sh`.
 selfplay_gpu:
   device: cuda            # [cloud] GPU dédié (selfplay hérite cpu, cette section écrase)
-  games: 256              # parties en parallèle — NE PAS monter >512 : Python MCTS est
-                          # single-thread, le ratio GPU/CPU est FIXE quel que soit games.
-                          # Plus de games = plus de travail Python, pas de gain GPU.
+  games: 256              # parties en parallèle PAR PROCESS (batch GPU = games×leaves).
+                          # [H100] Le MCTS est du Python mono-thread : un seul process
+                          # plafonne le GPU à ~14 %. Le débit vient du MULTI-WORKER
+                          # (run_selfplay_gpu.sh / run_rl_cloud.sh lancent N process,
+                          # ~16 saturent le H100). games×leaves ≈ 256-512/process suffit
+                          # pour des batchs tensor-core efficaces ; inutile de monter
+                          # plus haut par process, mieux vaut ajouter des workers.
   nodes: 200              # simulations MCTS par coup (↑ = parties plus fortes mais plus lentes)
   leaves_per_game: 8      # feuilles collectées par partie avant le batch GPU
   flush_games: 32         # écrit un shard tous les N parties

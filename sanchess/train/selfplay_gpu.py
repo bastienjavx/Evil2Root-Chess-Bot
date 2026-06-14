@@ -33,6 +33,7 @@ Usage :
 from __future__ import annotations
 
 import argparse
+import signal
 import time
 from pathlib import Path
 
@@ -366,6 +367,14 @@ def main() -> None:
                     default=bool(s.get("compile", False)),
                     help="torch.compile l'évaluateur (reduce-overhead)")
     args = ap.parse_args()
+
+    # run_rl_cloud.sh / run_selfplay_gpu.sh arrêtent les workers avec SIGTERM (kill,
+    # docker stop, fin de groupe de session). Sans ça, SIGTERM tue le process AVANT
+    # le `finally` -> le dernier lot de samples non flushé est PERDU. On le traduit en
+    # KeyboardInterrupt : même chemin de sortie propre que Ctrl-C (flush final).
+    def _on_sigterm(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
     device = resolve_device(args.device or cfg.get("train", {}).get("device", "auto"))
     search_cfg = _build_search_cfg(cfg, args)

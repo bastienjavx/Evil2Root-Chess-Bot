@@ -55,11 +55,46 @@ def amp_enabled(device: str, want_amp: bool = True) -> bool:
     return bool(want_amp) and device_kind(device) == "cuda"
 
 
-def autocast_ctx(device: str, enabled: bool):
-    """Contexte autocast adapté à l'appareil (no-op si désactivé)."""
+def resolve_amp_dtype(device: str, requested: str | None) -> "torch.dtype":
+    """Résout le dtype d'autocast demandé en config (`train.amp_dtype`).
+
+    `bf16` n'existe matériellement qu'à partir d'Ampere (compute >= 8.0). Sur
+    Turing (RTX 2070 Super, compute 7.5) ou tout GPU sans bf16, on retombe
+    AUTOMATIQUEMENT sur fp16 -> le même config.cloud.yaml (bf16) reste utilisable
+    sur la 2070S sans planter. fp16 reste le défaut (compatible partout).
+    """
+    want = str(requested or "fp16").lower()
+    if want in ("bf16", "bfloat16"):
+        if device_kind(device) == "cuda" and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16          # Turing & co : pas de bf16 -> fp16
+    return torch.float16
+
+
+def autocast_ctx(device: str, enabled: bool, dtype: "torch.dtype | None" = None):
+    """Contexte autocast adapté à l'appareil (no-op si désactivé).
+
+    `dtype` (optionnel) force la précision réduite : bf16 (plage dynamique large,
+    pas besoin de GradScaler) ou fp16 (défaut historique). Ignoré hors CUDA.
+    """
     if not enabled:
         return contextlib.nullcontext()
-    return torch.autocast(device_type=device_kind(device), enabled=True)
+    kind = device_kind(device)
+    if dtype is not None and kind == "cuda":
+        return torch.autocast(device_type=kind, enabled=True, dtype=dtype)
+    return torch.autocast(device_type=kind, enabled=True)
+
+
+def unwrap_model(model):
+    """Renvoie le module sous-jacent d'un modèle `torch.compile`.
+
+    `torch.compile` enveloppe le réseau dans un `OptimizedModule` dont le
+    `state_dict()` PRÉFIXE toutes les clés par `_orig_mod.`. Sauvegarder tel quel
+    rend le checkpoint illisible par le bot/online/web (chargement silencieux d'un
+    réseau à moitié ré-initialisé). On sauvegarde donc TOUJOURS via le module
+    d'origine pour garder des clés propres et compatibles.
+    """
+    return getattr(model, "_orig_mod", model)
 
 
 def load_dotenv(path: str | os.PathLike | None = None) -> None:
@@ -88,7 +123,7 @@ def save_checkpoint(path: str | os.PathLike, model, cfg: dict,
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "model_state": model.state_dict(),
+        "model_state": unwrap_model(model).state_dict(),
         "model_cfg": cfg.get("model", {}),
         "step": step,
     }
