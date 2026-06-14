@@ -144,6 +144,14 @@ def _warm_runtime_before_mem_limit() -> None:
     np.random.choice(1)
 
 
+def _effective_mem_limit_mb(requested_mb: int, latest: Path) -> int:
+    """Ne pose pas un plafond inférieur au minimum requis par le checkpoint."""
+    if requested_mb <= 0:
+        return requested_mb
+    floor = _checkpoint_load_floor_mb(latest) if latest.exists() else 0
+    return max(int(requested_mb), floor)
+
+
 def _maybe_reload(model, latest: Path, mtime, device):
     """Recharge les poids si latest.pt a changé. Retourne le nouveau mtime."""
     if not latest.exists():
@@ -201,7 +209,11 @@ def run_worker(wid: int, cfg: dict, device: str, args):
         model = build_model(cfg)
         mtime = None
     _warm_runtime_before_mem_limit()
-    _limit_memory(int(args.mem_limit_mb))              # plafond RAM/worker (anti-freeze)
+    mem_limit_mb = _effective_mem_limit_mb(int(args.mem_limit_mb), latest)
+    if mem_limit_mb != int(args.mem_limit_mb):
+        print(f"[selfplay w{wid}] RAM limit relevé {args.mem_limit_mb} -> "
+              f"{mem_limit_mb} Mo pour ce checkpoint", flush=True)
+    _limit_memory(mem_limit_mb)                        # plafond RAM/worker (anti-freeze)
     ev = Evaluator(model, device)
     mcts = MCTS(ev, cfg)
     mcts.dir_eps = float(args.dirichlet_eps)           # bruit racine pour explorer
