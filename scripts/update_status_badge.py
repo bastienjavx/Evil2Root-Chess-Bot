@@ -62,21 +62,38 @@ def build_badges(stats) -> dict[str, dict]:
     summary = stats.training_summary()
     gpus = stats.gpu_info()
 
-    train_active = svc.get("sano1-train", {}).get("active")
-    online_active = svc.get("sano1-online", {}).get("active")
+    # Repli hors systemd : détection des process via /proc (entraînement lancé
+    # à la main). On combine services actifs OU process correspondant.
+    mods = [p.get("module", "") for p in stats.training_processes()]
+
+    def _proc(*names) -> bool:
+        return any(m.startswith(n) for m in mods for n in names)
+
+    pretrain_running = bool(svc.get("sano1-train", {}).get("active")) or \
+        _proc("train.pretrain")
+    online_running = bool(svc.get("sano1-online", {}).get("active")) or \
+        _proc("train.online")
+    distributed_running = _proc("train.distributed")
+    selfplay_running = _proc("train.selfplay")  # couvre selfplay et selfplay_gpu
 
     # --- badge training ---
-    if train_active and "pretrain" in summary:
+    if pretrain_running and "pretrain" in summary:
         p = summary["pretrain"]
         msg = f"pretrain · step {_fmt_step(p['step'])} · pol {p['policy']:.2f}"
         color = "brightgreen"
-    elif online_active and "online" in summary:
+    elif online_running and "online" in summary:
         o = summary["online"]
         msg = f"online · step {_fmt_step(o['step'])} · loss {o['loss']:.2f}"
         color = "brightgreen"
-    elif train_active or online_active:
+    elif distributed_running:
+        msg = "distributed"
+        color = "brightgreen"
+    elif pretrain_running or online_running:
         msg = "starting…"
         color = "yellow"
+    elif selfplay_running:
+        msg = "self-play (data gen)"
+        color = "blue"
     else:
         msg = "idle"
         color = "lightgrey"
