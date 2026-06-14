@@ -66,8 +66,9 @@ jobs:
           # torch CPU explicite : évite de tirer les wheels CUDA (lourds, inutiles en CI).
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements.txt
-          # Outils de test + ONNX pour couvrir tests/test_export.py.
-          pip install pytest onnx onnxruntime
+          # Outils de test : pytest, httpx (requis par FastAPI TestClient dans
+          # test_cluster.py), ONNX pour couvrir tests/test_export.py.
+          pip install pytest httpx onnx onnxruntime
 
       - name: Run tests
         run: python -m pytest tests/ -v
