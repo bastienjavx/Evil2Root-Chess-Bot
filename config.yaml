@@ -1,22 +1,40 @@
 # Configuration San-o1 — IA d'échecs neuronale (AlphaZero/Lc0-like)
 
 model:
-  arch: v2                # v2 = résidus SE + attention globale + features tactiques
+  # === Archi v3 (preset BLITZ par défaut, optimisé RTX 2070S Turing) ==========
+  # v3 = tronc SE + ATTENTION GÉOMÉTRIQUE efficiente (SDPA à dim réduite + biais
+  # de position appris, bien plus rapide que l'attention v2 sur Turing) + TÊTE
+  # MOVES-LEFT (tâche auxiliaire : meilleure conversion des finales / anti-nulle).
+  # Tailles MESURÉES sur la 2070S (scripts/bench_eval.py, batch 16, fp16) : débit
+  # d'évals/s = nœuds MCTS à temps fixe = force en blitz. Presets :
+  #   BLITZ (défaut)  : 20x256 att/6 dim128 -> ~3280 év/s, ~16400 nœuds@5s (plafond)
+  #                     => ~10-11k nœuds réels @5s, ~2x la cible tactique (~5000).
+  #   CLASSIQUE       : 24x320 att/6 dim160 -> ~1690 év/s, ~8400 nœuds@5s (= config.cloud.yaml)
+  # Mesures clés : l'attention fréquente coûte ~30% de débit (le tronc conv domine
+  # sinon) ; la géométrique v3 bat la MHA v2 de ~8-11% quand elle est fréquente ;
+  # la tête moves-left ne coûte que ~1%. Le checkpoint embarque son model_cfg ->
+  # le bot/online/web reconstruisent l'archi exacte au hot-reload.
+  arch: v3
   input_features: tactical # "base" (19 plans legacy) ou "tactical" (21 plans)
-  channels: 256          # filtres des blocs résiduels (réseau agrandi)
-  blocks: 20             # nombre de blocs résiduels (20x256 ~ petit Lc0)
+  channels: 256          # filtres des blocs résiduels
+  blocks: 20             # profondeur (20 = preset blitz mesuré ; 24 = classique)
   se: true               # blocs Squeeze-Excitation (recalibrage par canal, +force)
   se_ratio: 4            # ratio de réduction du MLP SE
-  attention_every: 5      # v2 : insère une attention globale toutes les N couches
-  attention_heads: 8      # v2 : doit diviser channels
-  attention_dropout: 0.0  # v2 : 0 pour garder l'inférence déterministe/rapide
+  attention_every: 6      # attention géométrique toutes les N couches (0 = conv-only)
+  attention_heads: 8      # doit diviser attention_dim
+  attention_dim: 128      # dim réduite de l'attention v3 (< channels -> +débit ; 0 = channels//2)
+  attention_dropout: 0.0  # 0 pour une inférence déterministe/rapide
   policy_head: conv      # "conv" (tête politique convolutive style Lc0, +force) ou "flat" (FC legacy)
   activation: mish       # "mish" (gain mesuré sur Lc0), "silu" ou "relu" (legacy)
   value_hidden: 256      # largeur de la couche cachée de la tête valeur
   value_channels: 32     # canaux de la conv 1x1 de la tête valeur (8 = legacy)
+  moves_left_head: true  # tête « demi-coups restants » (auxiliaire ; v3 only)
+  moves_left_hidden: 128 # largeur de la couche cachée de la tête moves-left
   policy_size: 4672      # 64 cases x 73 types de coups (encodage AlphaZero) — NE PAS changer
-  # Moteur TensorRT optionnel (inférence ~2-3x plus rapide sur la 2070S Turing ->
-  # plus de nœuds MCTS à temps fixe -> +Elo). Le compiler SUR la 2070S cible :
+  # --- Accélération d'inférence (plus de nœuds MCTS à temps fixe -> +Elo) ------
+  compile_inference: false # true sur la 2070S : torch.compile(dynamic) au chargement
+                           # du moteur (bot/uci/web). dynamic gère les batchs variables.
+  # Moteur TensorRT optionnel (~2-3x sur Turing). Le compiler SUR la 2070S cible :
   #   python -m sanchess.export --ckpt checkpoints/latest.pt --trt checkpoints/sano1.ts --fp16
   # puis renseigner le chemin ci-dessous. Repli automatique sur PyTorch si absent.
   # trt_engine: checkpoints/sano1.ts
@@ -65,6 +83,9 @@ train:
   lr: 0.001
   weight_decay: 0.0001
   value_loss_weight: 1.0
+  moves_left_weight: 0.3 # poids de la perte auxiliaire moves-left (v3 ; ignoré si
+                         # le modèle n'a pas la tête. Cible masquée sur les shards
+                         # sans plies_to_end -> aucun re-download nécessaire).
   amp: true              # mixed precision (CUDA uniquement ; ignoré sur MPS/CPU)
   amp_dtype: fp16        # "fp16" (+ GradScaler) ou "bf16". La 2070S (Turing, compute
                          # 7.5) N'A PAS de bf16 matériel -> garder fp16 ici. Demander

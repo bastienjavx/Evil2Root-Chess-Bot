@@ -8,8 +8,8 @@ from __future__ import annotations
 import torch
 
 from sanchess.encoding import INPUT_PLANES, POLICY_SIZE, TACTICAL_INPUT_PLANES
-from sanchess.model import (SanChessNet, SanChessNetV2, build_model,
-                            build_model_from_checkpoint)
+from sanchess.model import (SanChessNet, SanChessNetV2, SanChessNetV3,
+                            build_model, build_model_from_checkpoint)
 from sanchess.utils import (amp_enabled, device_kind, load_model_state,
                             resolve_device)
 
@@ -23,10 +23,11 @@ def test_forward_shapes():
                               activation=activation).eval()
             x = torch.randn(4, INPUT_PLANES, 8, 8)
             with torch.no_grad():
-                logits, value = net(x)
+                logits, value, moves_left = net(x)
             assert logits.shape == (4, POLICY_SIZE), logits.shape
             assert value.shape == (4, 1), value.shape
             assert torch.all(value >= -1) and torch.all(value <= 1)
+            assert moves_left is None       # tête moves-left désactivée par défaut
 
 
 def test_conv_policy_ordering():
@@ -65,14 +66,52 @@ def test_v2_forward_and_checkpoint_arch():
     assert isinstance(net, SanChessNetV2)
     x = torch.randn(2, TACTICAL_INPUT_PLANES, 8, 8)
     with torch.no_grad():
-        logits, value = net(x)
+        logits, value, moves_left = net(x)
     assert logits.shape == (2, POLICY_SIZE)
     assert value.shape == (2, 3)
+    assert moves_left is None       # v2 : pas de tête moves-left
 
     ckpt = {"model_cfg": cfg["model"], "model_state": net.state_dict()}
     rebuilt = build_model_from_checkpoint(ckpt, {})
     rebuilt.load_state_dict(ckpt["model_state"])
     assert rebuilt.cfg_meta["arch"] == "v2"
+
+
+def test_v3_geometric_attention_and_moves_left_head():
+    """v3 : attention géométrique efficiente + tête moves-left (B,) >= 0 ;
+    round-trip d'archi via le checkpoint."""
+    cfg = {"model": {"arch": "v3", "channels": 32, "blocks": 4, "se": True,
+                     "policy_head": "conv", "value_head": "wdl",
+                     "activation": "mish", "input_features": "tactical",
+                     "attention_every": 2, "attention_heads": 4,
+                     "attention_dim": 16}}
+    net = build_model(cfg).eval()
+    assert isinstance(net, SanChessNetV3)
+    assert net.has_moves_left
+    x = torch.randn(3, TACTICAL_INPUT_PLANES, 8, 8)
+    with torch.no_grad():
+        logits, value, moves_left = net(x)
+    assert logits.shape == (3, POLICY_SIZE)
+    assert value.shape == (3, 3)
+    assert moves_left.shape == (3,)
+    assert torch.all(moves_left >= 0)            # softplus
+
+    ckpt = {"model_cfg": net.cfg_meta, "model_state": net.state_dict()}
+    rebuilt = build_model_from_checkpoint(ckpt, {})
+    rebuilt.load_state_dict(ckpt["model_state"])   # archi reconstruite à l'identique
+    assert rebuilt.cfg_meta["arch"] == "v3"
+    assert rebuilt.cfg_meta["moves_left_head"] is True
+
+
+def test_v3_moves_left_head_can_be_disabled():
+    """v3 sans tête moves-left -> forward renvoie moves_left=None."""
+    cfg = {"model": {"arch": "v3", "channels": 16, "blocks": 2,
+                     "attention_every": 0, "moves_left_head": False}}
+    net = build_model(cfg).eval()
+    assert not net.has_moves_left
+    with torch.no_grad():
+        _, _, moves_left = net(torch.randn(2, TACTICAL_INPUT_PLANES, 8, 8))
+    assert moves_left is None
 
 
 def test_tolerant_load_across_architectures():
@@ -133,6 +172,9 @@ if __name__ == "__main__":
     test_forward_shapes()
     test_conv_policy_ordering()
     test_build_from_config_and_checkpoint()
+    test_v2_forward_and_checkpoint_arch()
+    test_v3_geometric_attention_and_moves_left_head()
+    test_v3_moves_left_head_can_be_disabled()
     test_tolerant_load_across_architectures()
     test_resolve_device_and_helpers()
     test_flatten_roundtrip()

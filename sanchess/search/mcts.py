@@ -104,7 +104,13 @@ class Evaluator:
             t = t.contiguous(memory_format=torch.channels_last)
         with torch.autocast(device_type="cuda" if use_cuda else "cpu",
                             enabled=use_cuda):
-            logits, values = self.model(t)
+            out = self.model(t)
+        # Modèle natif -> (policy, value, moves_left|None) ; moteur exporté
+        # (TorchScript/TensorRT) -> (policy, value). On tolère les deux et on
+        # ignore moves_left dans la recherche (la tête sert surtout de tâche
+        # auxiliaire à l'entraînement ; pas de tie-break ici pour ne pas
+        # perturber le MCTS batché finement réglé).
+        logits, values = out[0], out[1]
         # Un checkpoint en cours d'écriture / divergé peut sortir des NaN/inf :
         # on les neutralise ici (logits -> 0 => priors uniformes, value -> 0)
         # pour que le self-play continue au lieu de propager des NaN dans l'arbre.

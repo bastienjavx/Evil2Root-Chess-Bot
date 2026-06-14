@@ -43,9 +43,28 @@ from .model import build_model, build_model_from_checkpoint
 from .utils import load_checkpoint, load_config, load_model_state, resolve_device
 
 
+class _PolicyValueExport(torch.nn.Module):
+    """Réduit la sortie du réseau à (policy, value) pour l'export ONNX/TensorRT.
+
+    Le réseau natif renvoie un 3-uplet (policy, value, moves_left|None). La tête
+    moves-left ne sert PAS à l'inférence (cf. `mcts.Evaluator` qui ne lit que
+    policy+value) et `None` n'est pas exportable -> on l'écarte ici. Le moteur
+    exporté a donc 2 sorties stables, consommées telles quelles par l'Evaluator."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.input_features = getattr(model, "input_features", "base")
+
+    def forward(self, x):
+        out = self.model(x)
+        return out[0], out[1]
+
+
 def load_model_for_export(ckpt_path: Path, cfg: dict, device: str):
     """Reconstruit le réseau depuis l'archi EMBARQUÉE dans le checkpoint (et non
-    la config courante) et charge les poids. Renvoie le modèle en eval()."""
+    la config courante) et charge les poids. Renvoie le modèle en eval().
+    `export_onnx`/`compile_trt` réduisent eux-mêmes la sortie à (policy, value)."""
     if ckpt_path.exists():
         ck = load_checkpoint(ckpt_path, map_location=device)
         model = build_model_from_checkpoint(ck, cfg)
@@ -61,6 +80,7 @@ def export_onnx(model, out_path: Path, device: str,
     """Exporte en ONNX avec un axe de batch DYNAMIQUE (batch 1..N supportés)."""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    model = _PolicyValueExport(model).to(device).eval()   # 2 sorties (policy, value)
     input_planes = input_planes_for_features(getattr(model, "input_features", "base"))
     dummy = torch.randn(sample_batch, input_planes, 8, 8, device=device)
     dyn = {"board": {0: "batch"},
@@ -91,6 +111,7 @@ def compile_trt(model, device: str, fp16: bool = True,
     if not str(device).startswith("cuda"):
         raise RuntimeError("La compilation TensorRT exige un GPU CUDA (device=cuda).")
 
+    model = _PolicyValueExport(model).to(device).eval()   # 2 sorties (policy, value)
     input_planes = input_planes_for_features(getattr(model, "input_features", "base"))
     inputs = [torch_tensorrt.Input(
         min_shape=(min_batch, input_planes, 8, 8),
@@ -126,27 +147,45 @@ class _InferenceWrapper(torch.nn.Module):
 
 
 def make_inference_model(cfg: dict, base_model, device: str):
-    """Renvoie le moteur compilé TensorRT si `model.trt_engine` est renseigné et
-    chargeable, sinon le modèle PyTorch fourni (repli sans régression). Utilisé par
-    le moteur UCI / le bot / le web pour accélérer l'inférence de façon optionnelle."""
-    path = (cfg.get("model", {}) or {}).get("trt_engine")
-    if not path:
-        return base_model
-    p = Path(path)
-    if not p.exists():
-        sys.stderr.write(f"info string trt_engine introuvable ({p}) -> modèle PyTorch.\n")
-        return base_model
-    if not str(device).startswith("cuda"):
-        sys.stderr.write("info string trt_engine ignoré (device != cuda) -> PyTorch.\n")
-        return base_model
-    try:
-        m = load_compiled(p, device)
-        m = _InferenceWrapper(m, getattr(base_model, "input_features", "base")).eval()
-        sys.stderr.write(f"info string moteur TensorRT chargé : {p}\n")
-        return m
-    except Exception as e:  # noqa: BLE001 — repli robuste
-        sys.stderr.write(f"info string échec chargement TensorRT ({e}) -> PyTorch.\n")
-        return base_model
+    """Renvoie un moteur d'inférence accéléré pour le MCTS (UCI / bot / web),
+    avec repli sans régression sur le modèle PyTorch fourni :
+
+      1. si `model.trt_engine` pointe un moteur TensorRT chargeable -> on l'utilise
+         (≈2-3× sur Turing -> plus de nœuds MCTS à temps fixe) ;
+      2. sinon, si `model.compile_inference: true` (CUDA), on applique
+         `torch.compile(..., dynamic=True)` — `dynamic` est IMPÉRATIF car les
+         formes d'entrée varient (racine = batch 1, feuilles 1..eval_batch_size,
+         lot partiel) : sans lui chaque nouvelle forme recompile (latence) ;
+      3. sinon le modèle eager tel quel.
+
+    Dans tous les cas la sortie reste (policy, value[, moves_left]) et l'Evaluator
+    ne lit que les deux premières."""
+    mcfg = cfg.get("model", {}) or {}
+    path = mcfg.get("trt_engine")
+    if path:
+        p = Path(path)
+        if not p.exists():
+            sys.stderr.write(f"info string trt_engine introuvable ({p}) -> modèle PyTorch.\n")
+        elif not str(device).startswith("cuda"):
+            sys.stderr.write("info string trt_engine ignoré (device != cuda) -> PyTorch.\n")
+        else:
+            try:
+                m = load_compiled(p, device)
+                m = _InferenceWrapper(m, getattr(base_model, "input_features", "base")).eval()
+                sys.stderr.write(f"info string moteur TensorRT chargé : {p}\n")
+                return m
+            except Exception as e:  # noqa: BLE001 — repli robuste
+                sys.stderr.write(f"info string échec chargement TensorRT ({e}) -> PyTorch.\n")
+
+    if mcfg.get("compile_inference") and str(device).startswith("cuda"):
+        try:
+            compiled = torch.compile(base_model, dynamic=True)
+            sys.stderr.write("info string torch.compile (dynamic) activé pour l'inférence.\n")
+            return compiled
+        except Exception as e:  # noqa: BLE001 — repli robuste
+            sys.stderr.write(f"info string torch.compile indisponible ({e}) -> PyTorch.\n")
+
+    return base_model
 
 
 def main() -> None:

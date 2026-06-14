@@ -99,3 +99,31 @@ def value_to_scalar(value_out: torch.Tensor) -> torch.Tensor:
         p = F.softmax(value_out, dim=1)
         return p[:, 2] - p[:, 0]
     return value_out.reshape(-1)
+
+
+# --- Tête « moves-left » (auxiliaire) ----------------------------------------
+
+MOVES_LEFT_SCALE = 100.0   # normalisation des demi-coups restants (plies / 100)
+
+
+def moves_left_target(plies_to_end: int | None) -> tuple[float, float]:
+    """(cible normalisée, masque) pour la tête moves-left.
+
+    `plies_to_end` absent (shards historiques) -> masque 0 : la position ne
+    contribue pas à la perte MLH (aucun re-download requis)."""
+    if plies_to_end is None:
+        return 0.0, 0.0
+    return float(plies_to_end) / MOVES_LEFT_SCALE, 1.0
+
+
+def moves_left_loss(pred: torch.Tensor, target: torch.Tensor,
+                    mask: torch.Tensor) -> torch.Tensor:
+    """Huber (smooth L1) masquée entre demi-coups restants prédits et cibles.
+
+    `pred` = sortie de la tête (B,) (déjà >= 0). `mask` ∈ {0,1} exclut les
+    positions sans cible. Renvoie 0 si aucune cible dans le lot (évite NaN)."""
+    pred = pred.float().reshape(-1)
+    target = target.float().reshape(-1)
+    mask = mask.float().reshape(-1)
+    per = F.smooth_l1_loss(pred, target, reduction="none")
+    return (per * mask).sum() / mask.sum().clamp_min(1.0)

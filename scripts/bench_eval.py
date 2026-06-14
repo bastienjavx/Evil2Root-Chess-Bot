@@ -29,7 +29,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from sanchess.encoding import INPUT_PLANES
+from sanchess.encoding import input_planes_for_features
 from sanchess.model import SanChessNet, _model_kwargs
 from sanchess.utils import load_config
 
@@ -40,19 +40,25 @@ def parse_size(s: str) -> tuple[int, int]:
     return int(b), int(c)
 
 
-def build(blocks: int, channels: int, base_model_cfg: dict) -> SanChessNet:
+def build(blocks: int, channels: int, base_model_cfg: dict,
+          overrides: dict | None = None) -> SanChessNet:
     """Réseau aux options de config.yaml (se/policy_head/value_head/activation…),
-    seuls blocs et canaux étant remplacés par la taille candidate."""
+    blocs/canaux remplacés par la taille candidate, plus d'éventuels `overrides`
+    (arch, attention_every, attention_dim, moves_left_head…) pour comparer des
+    variantes (v2 attention historique vs v3 attention géométrique vs conv-only)."""
     mcfg = dict(base_model_cfg)
     mcfg["blocks"] = blocks
     mcfg["channels"] = channels
+    if overrides:
+        mcfg.update(overrides)
     return SanChessNet(**_model_kwargs(mcfg))
 
 
 @torch.no_grad()
 def measure(model, device, batch, dtype, iters, warmup):
     """Renvoie évals/s pour un batch donné (autocast si dtype != fp32)."""
-    x = torch.randn(batch, INPUT_PLANES, 8, 8, device=device)
+    planes = input_planes_for_features(getattr(model, "input_features", "base"))
+    x = torch.randn(batch, planes, 8, 8, device=device)
     use_amp = device.startswith("cuda") and dtype != "fp32"
     amp_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
     cm = (torch.autocast(device_type="cuda", dtype=amp_dtype)
@@ -90,8 +96,26 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--compile", action="store_true",
                     help="essaie torch.compile (peut être plus lent à formes variables)")
+    ap.add_argument("--arch", default=None, choices=["v1", "v2", "v3"],
+                    help="forcer l'archi (défaut: celle du config.yaml)")
+    ap.add_argument("--attention-every", type=int, default=None, dest="attention_every",
+                    help="0 = conv-only ; sinon attention toutes les N couches")
+    ap.add_argument("--attention-dim", type=int, default=None, dest="attention_dim",
+                    help="dim réduite de l'attention v3 (défaut: channels//2)")
+    ap.add_argument("--no-moves-left", action="store_true", dest="no_moves_left",
+                    help="désactiver la tête moves-left (mesurer son surcoût)")
     ap.add_argument("--device", default=None, help="cuda / cuda:0 / cpu (défaut: auto)")
     args = ap.parse_args()
+
+    overrides: dict = {}
+    if args.arch is not None:
+        overrides["arch"] = args.arch
+    if args.attention_every is not None:
+        overrides["attention_every"] = args.attention_every
+    if args.attention_dim is not None:
+        overrides["attention_dim"] = args.attention_dim
+    if args.no_moves_left:
+        overrides["moves_left_head"] = False
 
     cfg = load_config()
     base_model_cfg = cfg.get("model", {})
@@ -119,7 +143,7 @@ def main() -> None:
     for s in args.sizes:
         blocks, channels = parse_size(s)
         try:
-            model = build(blocks, channels, base_model_cfg).to(device).eval()
+            model = build(blocks, channels, base_model_cfg, overrides).to(device).eval()
         except Exception as e:  # OOM à la construction d'un très gros réseau
             print(f"{s:>10} | échec construction: {e}")
             continue

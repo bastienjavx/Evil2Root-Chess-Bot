@@ -791,10 +791,19 @@ class LichessBot:
         result_bot = result_white if g.my_color == chess.WHITE else -result_white
         recs = g.records
         n = len(recs)
+        # plies_to_end (cible moves-left v3) : ply absolu déduit de la FEN (exact
+        # pour chaque position), fin de partie estimée au dernier ply enregistré
+        # +1. Les records ne couvrent que les coups du bot, mais le ply FEN reste
+        # la vraie distance à la fin.
+        def _ply(fen: str) -> int:
+            p = fen.split()
+            return 2 * (int(p[5]) - 1) + (0 if p[1] == "w" else 1)
+        end_ply = max((_ply(r[0]) for r in recs), default=0) + 1
         rows: list[tuple] = []
         blunders = 0
         for i, (fen, uci, pi, score) in enumerate(recs):
-            row = (fen, uci, result_bot, pi)
+            plies_to_end = max(1, end_ply - _ply(fen))
+            row = (fen, uci, result_bot, pi, plies_to_end)
             # Deux signaux d'ERREUR, calibrés pour ne pas tout marquer :
             #  1) l'éval du bot s'effondre à son coup suivant (chute >= seuil) ;
             #  2) gain jeté : il se croyait nettement gagnant (>=0.5 ~ 75% de

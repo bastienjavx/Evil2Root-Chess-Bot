@@ -13,11 +13,29 @@ from torch.utils.data import Dataset
 
 from ..data.samples import _parse_policy
 from ..encoding import encode_board, legal_policy_mask
-from .losses import dense_policy_target
+from .losses import dense_policy_target, moves_left_target
 
 
 def find_shards(shards_dir: str | Path) -> list[Path]:
     return sorted(Path(shards_dir).glob("*.txt.gz"))
+
+
+def split_batch(batch, mask_policy: bool, moves_left: bool):
+    """Déballe un batch du DataLoader en (planes, policy, legal_mask|None,
+    value, ml_target|None, ml_mask|None) quels que soient les flags actifs.
+    Centralise l'ordre des tenseurs pour pretrain / online / distributed."""
+    i = 0
+    planes = batch[i]; i += 1
+    policy = batch[i]; i += 1
+    legal_mask = None
+    if mask_policy:
+        legal_mask = batch[i]; i += 1
+    value = batch[i]; i += 1
+    ml_target = ml_mask = None
+    if moves_left:
+        ml_target = batch[i]; i += 1
+        ml_mask = batch[i]; i += 1
+    return planes, policy, legal_mask, value, ml_target, ml_mask
 
 
 class ShardDataset(Dataset):
@@ -40,9 +58,11 @@ class ShardDataset(Dataset):
 
     def __init__(self, shard_paths: list[Path],
                  max_samples: int | None = None, seed: int = 0,
-                 input_features: str = "base", mask_policy: bool = False):
+                 input_features: str = "base", mask_policy: bool = False,
+                 moves_left: bool = False):
         self.input_features = input_features
         self.mask_policy = bool(mask_policy)
+        self.moves_left = bool(moves_left)
         paths = list(shard_paths)
         if max_samples:
             random.Random(seed).shuffle(paths)
@@ -86,4 +106,9 @@ class ShardDataset(Dataset):
         if self.mask_policy:
             out.append(torch.from_numpy(legal_policy_mask(board)))
         out.append(torch.tensor(value, dtype=torch.float32))
+        if self.moves_left:
+            ml = int(parts[4]) if len(parts) > 4 and parts[4].strip() else None
+            tgt, mask = moves_left_target(ml)
+            out.append(torch.tensor(tgt, dtype=torch.float32))
+            out.append(torch.tensor(mask, dtype=torch.float32))
         return tuple(out)

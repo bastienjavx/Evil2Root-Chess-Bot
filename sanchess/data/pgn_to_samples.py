@@ -100,10 +100,14 @@ def convert(pgn_src, out_dir: Path, cfg: dict,
 
         result_white = RESULT_VALUE[game.headers["Result"]]
         board = game.board()
-        for move in game.mainline_moves():
+        moves = list(game.mainline_moves())
+        total = len(moves)
+        for i, move in enumerate(moves):
             # valeur côté trait : +result_white si Blancs au trait, sinon l'opposé.
             value = result_white if board.turn == chess.WHITE else -result_white
-            buffer.append((board.fen(), move.uci(), value))
+            # plies_to_end : demi-coups restants jusqu'à la fin (cible moves-left).
+            plies_to_end = total - i
+            buffer.append((board.fen(), move.uci(), value, None, plies_to_end))
             board.push(move)
 
         games_kept += 1

@@ -23,13 +23,15 @@ import chess
 import numpy as np
 import torch
 
-from ..data.samples import iter_samples_pi
+from ..data.samples import iter_samples_full
 from ..encoding import encode_board, legal_policy_mask
 from ..model import build_model, build_model_from_checkpoint
 from ..utils import (amp_enabled, autocast_ctx, load_checkpoint, load_config,
                      load_model_state, resolve_amp_dtype, resolve_device,
                      save_checkpoint)
-from .losses import dense_policy_target, policy_loss, value_loss
+from .dataset import split_batch
+from .losses import (dense_policy_target, policy_loss, value_loss,
+                     moves_left_loss, moves_left_target)
 
 
 _RESULT_RE = re.compile(
@@ -38,19 +40,26 @@ _RESULT_RE = re.compile(
 
 
 def _encode_batch(rows, device, input_features: str = "base",
-                  mask_policy: bool = False):
-    boards = [chess.Board(f) for f, _, _, _ in rows]
+                  mask_policy: bool = False, moves_left: bool = False):
+    # rows = (fen, move, value, pi, plies_to_end) — cf. samples.iter_samples_full.
+    boards = [chess.Board(r[0]) for r in rows]
     planes = np.stack([encode_board(b, input_features) for b in boards])
     # Cible politique DENSE : distribution de visites (self-play) ou one-hot (humain).
-    policy = np.stack([dense_policy_target(b, m, pi)
-                       for b, (_, m, _, pi) in zip(boards, rows)])
-    val = np.fromiter((v for _, _, v, _ in rows), dtype=np.float32, count=len(rows))
+    policy = np.stack([dense_policy_target(b, r[1], r[3])
+                       for b, r in zip(boards, rows)])
+    val = np.fromiter((r[2] for r in rows), dtype=np.float32, count=len(rows))
     out = [torch.from_numpy(planes).to(device),
            torch.from_numpy(policy).to(device)]
     if mask_policy:
         mask = np.stack([legal_policy_mask(b) for b in boards])
         out.append(torch.from_numpy(mask).to(device))
     out.append(torch.from_numpy(val).to(device))
+    if moves_left:
+        pairs = [moves_left_target(r[4] if len(r) > 4 else None) for r in rows]
+        ml_t = np.fromiter((t for t, _ in pairs), dtype=np.float32, count=len(pairs))
+        ml_m = np.fromiter((m for _, m in pairs), dtype=np.float32, count=len(pairs))
+        out.append(torch.from_numpy(ml_t).to(device))
+        out.append(torch.from_numpy(ml_m).to(device))
     return tuple(out)
 
 
@@ -60,7 +69,7 @@ def _ingest_new_shards(buffer_dir: Path, processed: set, buf: deque) -> int:
         if shard.name in processed:
             continue
         try:
-            for row in iter_samples_pi(shard):
+            for row in iter_samples_full(shard):
                 buf.append(row)
                 n += 1
         except (OSError, EOFError):
@@ -161,6 +170,8 @@ def run(cfg: dict, seed_shards: str | None, args: argparse.Namespace):
     label_smooth = tcfg.get("label_smoothing", 0.0)
     mask_policy = bool(tcfg.get("mask_policy_loss", False))
     input_features = getattr(model, "input_features", save_model_cfg.get("input_features", "base"))
+    with_ml = bool(getattr(model, "has_moves_left", False))
+    mlw = tcfg.get("moves_left_weight", 0.3) if with_ml else 0.0
     model.train()
 
     buf: deque = deque(maxlen=ocfg["buffer_capacity"])
@@ -170,7 +181,7 @@ def run(cfg: dict, seed_shards: str | None, args: argparse.Namespace):
 
     if seed_shards:
         for shard in sorted(Path(seed_shards).glob("*.txt.gz")):
-            for row in iter_samples_pi(shard):
+            for row in iter_samples_full(shard):
                 buf.append(row)
         print(f"Buffer initialisé avec {len(buf)} samples (seed).")
 
@@ -205,20 +216,19 @@ def run(cfg: dict, seed_shards: str | None, args: argparse.Namespace):
 
             if len(buf) >= min_buffer and now - last_step_t >= step_every:
                 rows = random.sample(buf, min(batch_size, len(buf)))
-                batch = _encode_batch(rows, device, input_features, mask_policy)
-                if mask_policy:
-                    planes, target_policy, legal_mask, val = batch
-                else:
-                    planes, target_policy, val = batch
-                    legal_mask = None
+                batch = _encode_batch(rows, device, input_features, mask_policy, with_ml)
+                (planes, target_policy, legal_mask, val,
+                 target_ml, ml_mask) = split_batch(batch, mask_policy, with_ml)
                 if device == "cuda":
                     planes = planes.contiguous(memory_format=torch.channels_last)
                 opt.zero_grad(set_to_none=True)
                 with autocast_ctx(device, use_amp, amp_dtype):
-                    logits, value = model(planes)
+                    logits, value, moves_left = model(planes)
                     loss_p = policy_loss(logits, target_policy, label_smooth, legal_mask)
                     loss_v = value_loss(value, val)
                     loss = loss_p + cfg["train"]["value_loss_weight"] * loss_v
+                    if mlw and moves_left is not None:
+                        loss = loss + mlw * moves_left_loss(moves_left, target_ml, ml_mask)
                 scaler.scale(loss).backward()
                 if grad_clip and grad_clip > 0:
                     scaler.unscale_(opt)

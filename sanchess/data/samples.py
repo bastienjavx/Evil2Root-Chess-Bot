@@ -1,6 +1,6 @@
 """Format de samples partagé : lignes texte gzip.
 
-  fen <TAB> move_uci <TAB> value [ <TAB> policy ]
+  fen <TAB> move_uci <TAB> value [ <TAB> policy [ <TAB> plies_to_end ] ]
 
 - value ∈ {-1, 0, 1} = résultat de la partie DU POINT DE VUE DU JOUEUR AU TRAIT
   dans cette position (cohérent avec la tête valeur du réseau).
@@ -8,9 +8,15 @@
   self-play AlphaZero, encodée `uci:poids uci:poids …` (poids = entier de visites).
   Absente pour les samples humains (stream/pgn) : un seul coup connu -> la cible
   politique retombe sur un one-hot du `move_uci`.
+- plies_to_end (5ᵉ colonne, OPTIONNELLE) = nombre de demi-coups restants jusqu'à
+  la fin de la partie depuis cette position (cible de la tête « moves-left » v3).
+  N'apparaît QUE si la 4ᵉ colonne policy est présente (éventuellement vide) afin
+  de rester non ambiguë. Absente des shards historiques -> cible MLH masquée à
+  l'entraînement (aucun re-download nécessaire).
 
 On stocke la FEN plutôt que les plans encodés : disque léger, encodage à la volée.
-`iter_samples` ignore la 4ᵉ colonne (rétro-compatible) ; `iter_samples_pi` la rend.
+`iter_samples` ne rend que (fen, move, value) (rétro-compatible) ; `iter_samples_pi`
+rend en plus la policy ; `iter_samples_full` rend aussi plies_to_end.
 """
 
 from __future__ import annotations
@@ -39,9 +45,11 @@ def _parse_policy(field: str) -> dict[str, float] | None:
 
 
 def write_samples(path: str | Path, rows: Iterable[tuple], mode: str = "wt") -> int:
-    """Écrit/ajoute des samples. Chaque row est (fen, move, value) OU
-    (fen, move, value, policy) avec policy = {uci: poids} (ou None). Retourne le
-    nombre de lignes écrites."""
+    """Écrit/ajoute des samples. Chaque row est (fen, move, value),
+    (fen, move, value, policy) ou (fen, move, value, policy, plies_to_end) avec
+    policy = {uci: poids} (ou None) et plies_to_end = int (ou None). Retourne le
+    nombre de lignes écrites. Si plies_to_end est fourni, la colonne policy est
+    toujours émise (vide si None) pour rester non ambiguë au parsing."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     n = 0
@@ -49,7 +57,11 @@ def write_samples(path: str | Path, rows: Iterable[tuple], mode: str = "wt") -> 
         for row in rows:
             fen, move_uci, value = row[0], row[1], row[2]
             pi = row[3] if len(row) > 3 else None
-            if pi:
+            ml = row[4] if len(row) > 4 else None
+            if ml is not None:
+                f.write(f"{fen}\t{move_uci}\t{value}\t"
+                        f"{_format_policy(pi) if pi else ''}\t{int(ml)}\n")
+            elif pi:
                 f.write(f"{fen}\t{move_uci}\t{value}\t{_format_policy(pi)}\n")
             else:
                 f.write(f"{fen}\t{move_uci}\t{value}\n")
@@ -58,7 +70,7 @@ def write_samples(path: str | Path, rows: Iterable[tuple], mode: str = "wt") -> 
 
 
 def iter_samples(path: str | Path) -> Iterator[tuple[str, str, int]]:
-    """Rétro-compatible : (fen, move_uci, value). Ignore une éventuelle 4ᵉ colonne."""
+    """Rétro-compatible : (fen, move_uci, value). Ignore les colonnes 4+."""
     with gzip.open(path, "rt", encoding="utf-8") as f:
         for line in f:
             parts = line.rstrip("\n").split("\t")
@@ -72,3 +84,15 @@ def iter_samples_pi(path: str | Path):
             parts = line.rstrip("\n").split("\t")
             pi = _parse_policy(parts[3]) if len(parts) > 3 else None
             yield parts[0], parts[1], int(parts[2]), pi
+
+
+def iter_samples_full(path: str | Path):
+    """(fen, move_uci, value, pi, plies_to_end) où pi = {uci: poids}|None et
+    plies_to_end = int|None (None si la 5ᵉ colonne est absente -> cible MLH
+    masquée)."""
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            pi = _parse_policy(parts[3]) if len(parts) > 3 else None
+            ml = int(parts[4]) if len(parts) > 4 and parts[4].strip() else None
+            yield parts[0], parts[1], int(parts[2]), pi, ml

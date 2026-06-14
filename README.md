@@ -53,17 +53,18 @@ Two ways to play it:
 
 ## Features
 
-- 🧠 **ResNet policy + value network** with **Squeeze-Excitation** blocks (configurable, default **20×256 + SE**).
+- 🧠 **`v3` ResNet policy + value network** — Squeeze-Excitation residual tower + **efficient geometric attention** (SDPA at reduced dim with a learned per-head 64×64 positional bias) + **moves-left head**. Fully config-driven, backward-compatible with the legacy `v1`/`v2` archs. Default **20×256** (blitz preset).
+- ⚡ **Tuned for small GPUs (Turing)** — on an RTX 2070 SUPER the strength is throughput-bound (evals/s = MCTS nodes at fixed time). The geometric attention matches `v2`'s plain MHA when sparse and beats it ~8–11% when frequent, the moves-left head costs ~1%, and inference can be accelerated via **`torch.compile(dynamic)`** or a **TensorRT fp16 engine** — all measured by `scripts/bench_eval.py`.
 - 🌲 **PUCT MCTS** with batched GPU leaf evaluation, virtual loss, and Dirichlet root noise (self-play).
 - 📚 **Supervised pre-training** on Lichess monthly dumps — streamed and decompressed on the fly (no 30 GB download).
 - 🔄 **Continuous online learning** from live Lichess games, with a sliding replay buffer to limit catastrophic forgetting.
 - 🌐 **Distributed training across machines** — data-parallel over **Mac M1 (MPS) + Linux (CUDA/CPU)** via gloo all-reduce.
-- 🎯 **Modern training recipe** — LR warmup + cosine schedule, gradient clipping, label smoothing, optional weight EMA.
-- ♻️ **Hot-reload** — the engine picks up newly trained weights at the start of each game.
-- 🔌 **UCI protocol** + 🤖 **native Lichess bot** (challenge handling, clock-aware time management).
+- 🎯 **AlphaZero training targets** — soft policy cross-entropy (MCTS visit distribution), WDL value, masked moves-left auxiliary loss; LR warmup + cosine, gradient clipping, label smoothing, optional weight EMA.
+- ♻️ **Hot-reload** — the engine picks up newly trained weights at the start of each game; the checkpoint embeds its `model_cfg`, so the live engine rebuilds the exact architecture (even one trained in the cloud) without touching the local config.
+- 🔌 **UCI protocol** + 🤖 **native Lichess bot** (challenge handling, clock-aware time management, pondering).
 - 🍎 **Multi-accelerator** — automatic device selection (CUDA → Apple Silicon MPS → CPU).
-- 🧪 Unit-tested move ↔ index encoding and network forward pass.
-- ⚡ Mixed-precision training (AMP) on CUDA — the default network uses ~1.3 GB VRAM at batch 512.
+- 🧪 Unit-tested move ↔ index encoding, network forward pass, ONNX export, and training targets.
+- 🔥 Mixed-precision training (AMP) on CUDA — the default `20×256` network uses ~2 GB VRAM at batch 256.
 
 ## How it works
 
@@ -76,7 +77,7 @@ Two ways to play it:
   (live games)   ───┼─► stream.py ─► replay buffer ┴─► online.py ────┘          │ hot-reload
                     └──────────────────────────────────────────────┘          ▼
                                                                     ┌──────────────────────┐
-                    Board ──► encoding (19×8×8 planes) ──► ResNet ──►│  policy(4672)+value  │
+         Board ─► encoding (21×8×8 tactical planes) ─► v3 net ─►│ policy(4672)+value(WDL)+moves-left │
                                                                     └──────────┬───────────┘
                                                                                ▼
                                                                        PUCT MCTS search
@@ -87,20 +88,30 @@ Two ways to play it:
                                                       └────────────────────────────────────┘
 ```
 
-**Board encoding** — 19 planes of 8×8 (12 piece planes, side-to-move, castling rights,
-fifty-move counter, en-passant), canonicalised to the side-to-move perspective.
+**Board encoding** — 19 base planes of 8×8 (12 piece planes, side-to-move, castling rights,
+fifty-move counter, en-passant), canonicalised to the side-to-move perspective; the `tactical`
+feature set (default for `v2`/`v3`) adds 2 attack-map planes (21 total).
 
 **Move encoding** — the AlphaZero `64 × 73 = 4672` policy head (56 "queen" moves, 8 knight
 moves, 9 underpromotions per square); illegal moves are masked using `python-chess`.
+
+**Network (`v3`)** — SE residual tower with a `GeometricAttentionBlock` inserted every N blocks:
+scaled-dot-product attention at a reduced dimension plus a **learned `(heads, 64, 64)` relative
+positional bias** that captures square-to-square geometry (knight distance, files, diagonals) at
+near-zero per-token cost. Three heads: convolutional policy, WDL value, and an auxiliary
+moves-left head (used as a training target; not yet wired into MCTS selection).
 
 **Search** — PUCT selection `Q + c_puct · P · √N / (1 + n)`, network priors for expansion,
 value backup with alternating sign, batched leaf evaluation for GPU throughput.
 
 ## Hardware
 
-Developed and tested on an **NVIDIA RTX 2070 SUPER (8 GB)**. The default `20×256` network
-trains at ~5 steps/s (batch 512, AMP) using ~1.3 GB of VRAM, leaving plenty of headroom to
-scale the network up. CPU-only inference works but is slow.
+Developed and tested on an **NVIDIA RTX 2070 SUPER (8 GB)**. The default `v3` `20×256` network
+trains at ~8 steps/s (batch 256, AMP) using ~2 GB of VRAM. On this card VRAM is never the
+limit — strength is bounded by **evals/s** (MCTS nodes at fixed time). Use `scripts/bench_eval.py`
+to pick a size: the **blitz** preset (`20×256`, `config.yaml`) measures ~3.3k evals/s
+(~16k nodes @5 s ceiling), the **classical** preset (`24×320`, `config.cloud.yaml`) ~1.7k
+evals/s. CPU-only inference works but is slow.
 
 ## Installation
 
@@ -246,34 +257,37 @@ Run it as a service (auto-start on boot): copy `scripts/systemd/sano1-web.servic
 
 ```
 sanchess/
-├── encoding.py            8×8 planes + move ↔ index (4672) mapping
-├── model.py               ResNet: policy (4672) & value (tanh) heads
+├── encoding.py            8×8 planes (base/tactical) + move ↔ index (4672) mapping
+├── model.py               v1/v2/v3 nets: geometric attention, policy/WDL/moves-left heads
+├── export.py              ONNX / TensorRT export + torch.compile inference wrapper
 ├── uci.py                 UCI engine + weight hot-reload
 ├── book.py                Polyglot opening book (theory before MCTS)
-├── lichess_bot.py         native Lichess Bot API client
+├── lichess_bot.py         native Lichess Bot API client (pondering, RL self-record)
 ├── utils.py               config / checkpoints / .env loader
 ├── search/
 │   └── mcts.py            batched PUCT Monte-Carlo Tree Search
 ├── data/
 │   ├── download.py        Lichess monthly dumps (.pgn.zst)
-│   ├── pgn_to_samples.py  PGN → shards (streamed, Elo-filtered)
+│   ├── pgn_to_samples.py  PGN → shards (streamed, Elo-filtered, plies-to-end)
 │   ├── build_book.py      PGN → Polyglot .bin opening book
 │   ├── stream.py          live Lichess games → replay buffer
-│   └── samples.py         shared sample format (gzip text)
+│   └── samples.py         shared sample format (gzip text, optional policy + moves-left)
 ├── train/
-│   ├── dataset.py         PyTorch dataset (on-the-fly encoding)
+│   ├── dataset.py         PyTorch dataset (on-the-fly encoding) + batch unpacking
+│   ├── losses.py          AlphaZero targets: soft policy CE, WDL, masked moves-left
 │   ├── pretrain.py        supervised pre-training (AMP, LR schedule, EMA)
 │   ├── distributed.py     multi-machine data-parallel trainer (Mac M1 + Linux)
 │   ├── selfplay.py        CPU self-play → replay buffer
+│   ├── selfplay_gpu.py    batched GPU self-play (many games / one forward)
 │   └── online.py          continuous learning + hot-reload checkpoints
 └── web/
     ├── server.py          FastAPI app (REST + WebSocket)
     ├── engine.py          model manager: load/hot-reload, MCTS analysis
     ├── stats.py           log parsing + GPU/services/data status
     └── static/            zero-dependency frontend (board, charts, live play)
-scripts/                   one-command launchers
-tests/                     encoding round-trip tests
-config.yaml                all hyperparameters
+scripts/                   one-command launchers + bench_eval.py / monitor_train.py
+tests/                     encoding, model, export, training-target tests
+config.yaml                all hyperparameters (blitz preset) / config.cloud.yaml (classical)
 ```
 
 ## Configuration
@@ -282,17 +296,28 @@ All knobs live in [`config.yaml`](config.yaml):
 
 | Section | Key | Purpose |
 |---|---|---|
-| `model` | `channels`, `blocks` | network size (default 256×20; scale up for strength) |
+| `model` | `arch`, `channels`, `blocks` | network size & family (`v3` default; blitz `20×256`) |
+| `model` | `attention_every`, `attention_dim`, `moves_left_head` | geometric attention frequency/width, moves-left head |
+| `model` | `compile_inference`, `trt_engine` | inference acceleration (torch.compile / TensorRT) |
 | `mcts` | `c_puct`, `default_nodes`, `eval_batch_size` | search strength / speed |
-| `train` | `batch_size`, `lr`, `amp` | pre-training |
+| `train` | `batch_size`, `lr`, `amp`, `moves_left_weight` | pre-training |
 | `online` | `lr`, `buffer_capacity`, `min_buffer` | continuous-learning aggressiveness |
 | `data` | `min_elo`, `exclude_bullet` | training-data quality filter |
-| `bot` | `accept_variants`, `max_think_seconds` | Lichess bot behaviour |
+| `bot` | `accept_variants`, `max_think_seconds`, `ponder` | Lichess bot behaviour |
+
+Pick the network size from measured throughput on your GPU:
+
+```bash
+python scripts/bench_eval.py --arch v3 --sizes 20x256 24x320 --budget 5
+python scripts/bench_eval.py --arch v3 --attention-every 0   # conv-only baseline
+```
 
 ## Training pipeline
 
-1. **Supervised pre-training** — cross-entropy on the played move + MSE on the game result
-   (from the side-to-move perspective). Reaches a solid baseline quickly.
+1. **Supervised pre-training** — soft cross-entropy on the policy (one-hot for human games,
+   MCTS visit distribution for self-play) + WDL value cross-entropy + a masked moves-left
+   loss (only on shards carrying a `plies_to_end` column; transparently skipped otherwise).
+   Reaches a solid baseline quickly. Monitor with `python scripts/monitor_train.py --watch 30`.
 2. **Online fine-tuning** — small learning rate over a sliding window of recent + seeded
    games, to keep improving without forgetting.
 3. **Checkpoints** are written atomically (`tmp` + rename) so the engine can hot-reload safely.
@@ -308,10 +333,12 @@ finishes (see `scripts/online_after_pretrain.sh`).
    [CLOUD.md](CLOUD.md) (§5).
 
 **Turning a stronger net into real strength on the RTX 2070S** — in blitz, Elo ≈ nodes/move
-≈ eval throughput. Two accelerators ship in-tree: **tree reuse** between moves
-(`mcts.tree_reuse`, on by default — the subtree is carried over instead of rebuilt) and an
-optional **TensorRT fp16 engine** (`python -m sanchess.export --trt … --fp16`, ~2-3× eval
-throughput on Turing, falls back to PyTorch if absent). See [CLOUD.md](CLOUD.md) (§6).
+≈ eval throughput. Accelerators ship in-tree: **tree reuse** between moves (`mcts.tree_reuse`,
+on by default — the subtree is carried over instead of rebuilt), **`model.compile_inference: true`**
+(`torch.compile(dynamic=True)` over the live engine), and an optional **TensorRT fp16 engine**
+(`python -m sanchess.export --trt … --fp16`, ~2-3× eval throughput on Turing). All fall back to
+plain PyTorch if unavailable, and the moves-left head is dropped from the exported graph (the
+MCTS only needs policy+value). See [CLOUD.md](CLOUD.md) (§6).
 
 ## Distributed training (Mac M1 + Linux)
 
@@ -360,14 +387,18 @@ estimate rating and track progress across checkpoints.
 ## Roadmap
 
 - [x] Squeeze-Excitation residual blocks
+- [x] `v3` efficient geometric attention (reduced-dim SDPA + learned positional bias)
+- [x] Moves-left auxiliary head (training target)
+- [x] Throughput presets chosen from on-device benchmarks (`scripts/bench_eval.py`)
 - [x] Distributed multi-device training (Mac M1 + Linux)
 - [x] Apple Silicon (MPS) support
 - [x] WDL (win/draw/loss) value head
 - [x] Tree reuse between moves (subtree carried over, `mcts.tree_reuse`)
-- [x] ONNX / TensorRT export for faster MCTS inference (`sanchess.export`)
+- [x] ONNX / TensorRT export + `torch.compile` inference (`sanchess.export`)
 - [x] GPU-batched self-play for cloud RL (`sanchess.train.selfplay_gpu`)
 - [x] Self-play reinforcement learning on top of the supervised base (see [CLOUD.md](CLOUD.md))
-- [ ] Larger network (e.g. 20×384) and more training data
+- [ ] Wire the moves-left head into MCTS move selection (shorter wins / longer losses)
+- [ ] History planes (requires a non-FEN sample format)
 - [ ] Transposition table (cross-branch node sharing)
 
 ## Disclaimer

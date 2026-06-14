@@ -1,8 +1,11 @@
 # Entraîner sur le cloud (L40S / H100), faire tourner en local (RTX 2070S 8 Go)
 
 Objectif : pretrain rapide sur un gros GPU Scaleway, puis ramener le checkpoint
-qui **tourne ici** sans surprise. Le réseau cloud est `24x320` (sweet spot validé
-par `scripts/bench_eval.py` : encore jouable en blitz sur la 2070S).
+qui **tourne ici** sans surprise. Le réseau cloud est l'**archi `v3` preset
+classique `24x320`** (SE + attention géométrique efficiente + tête moves-left ;
+sweet spot validé par `scripts/bench_eval.py` : ~1,7k évals/s, encore jouable en
+blitz sur la 2070S). Le preset **blitz `20x256`** (`config.yaml`) s'entraîne très
+bien en local directement.
 
 ## Pourquoi ça « remarche » tel quel en local
 
@@ -53,7 +56,9 @@ Deux options :
 ```bash
 ./scripts/run_pretrain_cloud.sh
 # = python -m sanchess.train.pretrain --config config.cloud.yaml
-# 24x320, batch 1024, LR 0.002, num_workers 16, amp fp16, 1M steps.
+# v3 24x320, batch 1024, LR 0.002, num_workers 16, amp fp16, 1M steps.
+# (La tête moves-left s'entraîne sur les shards portant la colonne plies_to_end —
+#  self-play/online ; masquée sur les shards humains historiques, sans erreur.)
 ```
 
 Sur **H100 80 Go** tu peux pousser dans `config.cloud.yaml` : `train.batch_size`
@@ -140,13 +145,18 @@ comme au §3 ; le bot le recharge à chaud.
 
 # 6. Convertir le réseau en force RÉELLE sur la 2070S
 
-En blitz, l'Elo ≈ **nœuds/coup** ≈ débit d'éval. Deux accélérateurs, gratuits ou
-presque, déjà intégrés :
+En blitz, l'Elo ≈ **nœuds/coup** ≈ débit d'éval. Trois accélérateurs, gratuits ou
+presque, déjà intégrés (tous avec repli automatique sur PyTorch) :
 
 **Réutilisation d'arbre** (`mcts.tree_reuse: true`, défaut) — entre deux coups, on
 reprend le sous-arbre déjà calculé (notre coup + réponse adverse) au lieu de
 repartir de zéro. Rien à faire, c'est actif partout (UCI, bot, web). Invalidé
 automatiquement au hot-reload des poids.
+
+**`torch.compile` (le plus simple)** — `model.compile_inference: true` dans
+config.yaml : le moteur live est compilé en `torch.compile(dynamic=True)` au
+chargement (bot/uci/web). `dynamic` gère les batchs variables (racine 1, feuilles
+1..eval_batch_size) sans recompiler. Aucun fichier à produire.
 
 **Moteur TensorRT fp16** — sur Turing, ~2-3× le débit d'éval -> ~2× de nœuds.
 À compiler **sur la 2070S** (un moteur TRT est spécifique au GPU/driver, pas
@@ -167,4 +177,5 @@ python -m sanchess.export --ckpt checkpoints/latest.pt --onnx checkpoints/sano1.
 
 Repli automatique sur PyTorch si `torch_tensorrt`/le fichier sont absents : aucune
 régression possible. **Recompiler le moteur à chaque changement d'archi** (un
-moteur 20x256 ne convient pas à un 24x320).
+moteur 20x256 ne convient pas à un 24x320). L'export **écarte la tête moves-left**
+(le MCTS ne lit que politique+valeur) : le graphe exporté a 2 sorties stables.

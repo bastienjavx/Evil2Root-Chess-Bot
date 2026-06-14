@@ -25,12 +25,15 @@ def _search_cfg(nodes=24, max_plies=30):
 
 
 def _valid_samples(rows):
-    for fen, uci, value, pi in rows:
+    n = len(rows)
+    for i, (fen, uci, value, pi, plies_to_end) in enumerate(rows):
         chess.Board(fen)                       # FEN parsable
         chess.Move.from_uci(uci)               # coup UCI valide
         assert value in (-1, 0, 1)
         assert isinstance(pi, dict) and pi     # distribution de visites non vide
         assert all(int(w) >= 0 for w in pi.values())
+        # plies_to_end décroît de 1 à chaque position (cible moves-left).
+        assert plies_to_end == n - i
 
 
 def test_batched_selfplay_completes_games():
@@ -64,7 +67,7 @@ def test_value_sign_alternates_along_game():
             break
     if game is None:
         return                                 # toutes nulles (rare) : rien à vérifier
-    values = [v for _, _, v, _ in game]
+    values = [r[2] for r in game]
     for a, b in zip(values, values[1:]):
         assert a == -b, "les valeurs doivent alterner de signe (POV trait)"
 

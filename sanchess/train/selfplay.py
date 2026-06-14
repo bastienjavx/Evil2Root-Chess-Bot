@@ -91,8 +91,11 @@ def play_game(mcts: MCTS, nodes: int, max_plies: int,
     else:
         result_white = 0                          # partie tronquée -> nulle
 
-    return [(fen, mv, result_white if turn == chess.WHITE else -result_white, pi)
-            for fen, mv, turn, pi in history]
+    n = len(history)
+    # plies_to_end : demi-coups restants jusqu'à la fin (cible moves-left v3).
+    return [(fen, mv, result_white if turn == chess.WHITE else -result_white,
+             pi, n - i)
+            for i, (fen, mv, turn, pi) in enumerate(history)]
 
 
 # --- Worker -------------------------------------------------------------------

@@ -203,14 +203,17 @@ class _Game:
             result_white = 1 if res == "1-0" else (-1 if res == "0-1" else 0)
         else:
             result_white = 0                          # partie tronquée -> nulle
+        n = len(self.history)
+        # plies_to_end : demi-coups restants jusqu'à la fin (cible moves-left v3).
         self.history = [
-            (fen, uci, (result_white if turn == chess.WHITE else -result_white), pi)
-            for fen, uci, turn, pi in self.history
+            (fen, uci, (result_white if turn == chess.WHITE else -result_white),
+             pi, n - i)
+            for i, (fen, uci, turn, pi) in enumerate(self.history)
         ]
         self.done = True
 
     def samples(self) -> list[tuple]:
-        """Samples (fen, uci, valeur, pi) une fois la partie finalisée."""
+        """Samples (fen, uci, valeur, pi, plies_to_end) une fois finalisée."""
         return list(self.history)
 
 

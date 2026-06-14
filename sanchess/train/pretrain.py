@@ -21,12 +21,12 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from ..model import build_model
+from ..model import build_model, _model_kwargs
 from ..utils import (amp_enabled, autocast_ctx, load_checkpoint, load_config,
                      load_model_state, resolve_amp_dtype, resolve_device,
                      save_checkpoint, unwrap_model)
-from .dataset import ShardDataset, find_shards
-from .losses import policy_loss, value_loss
+from .dataset import ShardDataset, find_shards, split_batch
+from .losses import policy_loss, value_loss, moves_left_loss
 
 
 def lr_at_step(step: int, base_lr: float, warmup: int, total: int,
@@ -121,8 +121,10 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
     print(f"{len(shards)} shards trouvés. Chargement{cap_txt}…")
     mask_policy = bool(tcfg.get("mask_policy_loss", False))
     input_features = cfg.get("model", {}).get("input_features", "base")
+    with_ml = bool(_model_kwargs(cfg.get("model", {}))["moves_left_head"])
     ds = ShardDataset(shards, max_samples=max_samples,
-                      input_features=input_features, mask_policy=mask_policy)
+                      input_features=input_features, mask_policy=mask_policy,
+                      moves_left=with_ml)
     print(f"{len(ds)} samples chargés.")
 
     pin = device == "cuda"
@@ -159,6 +161,7 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
         print(f"AMP : {('bf16' if amp_dtype == torch.bfloat16 else 'fp16')}"
               f" (GradScaler {'actif' if use_scaler else 'désactivé'}).")
     vlw = tcfg.get("value_loss_weight", 1.0)
+    mlw = tcfg.get("moves_left_weight", 0.3) if with_ml else 0.0
     grad_clip = tcfg.get("grad_clip", 1.0)
     label_smooth = tcfg.get("label_smoothing", 0.0)
     warmup = tcfg.get("warmup_steps", 2000)
@@ -209,11 +212,8 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
     running_p = running_v = 0.0
     while step < max_steps:
         for batch in loader:
-            if mask_policy:
-                planes, target_policy, legal_mask, target_val = batch
-            else:
-                planes, target_policy, target_val = batch
-                legal_mask = None
+            (planes, target_policy, legal_mask, target_val,
+             target_ml, ml_mask) = split_batch(batch, mask_policy, with_ml)
             planes = planes.to(device, non_blocking=True)
             if device == "cuda":
                 planes = planes.contiguous(memory_format=torch.channels_last)
@@ -221,6 +221,9 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
             if legal_mask is not None:
                 legal_mask = legal_mask.to(device, non_blocking=True)
             target_val = target_val.to(device, non_blocking=True)
+            if target_ml is not None:
+                target_ml = target_ml.to(device, non_blocking=True)
+                ml_mask = ml_mask.to(device, non_blocking=True)
 
             lr = lr_at_step(step, base_lr, warmup, max_steps, schedule)
             for g in opt.param_groups:
@@ -228,10 +231,12 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
 
             opt.zero_grad(set_to_none=True)
             with autocast_ctx(device, use_amp, amp_dtype):
-                logits, value = model(planes)
+                logits, value, moves_left = model(planes)
                 loss_p = policy_loss(logits, target_policy, label_smooth, legal_mask)
                 loss_v = value_loss(value, target_val)
                 loss = loss_p + vlw * loss_v
+                if mlw and moves_left is not None:
+                    loss = loss + mlw * moves_left_loss(moves_left, target_ml, ml_mask)
 
             scaler.scale(loss).backward()
             if grad_clip and grad_clip > 0:
