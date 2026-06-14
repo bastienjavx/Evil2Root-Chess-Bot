@@ -3,5 +3,5 @@
 # octets et valider des shards de samples avec python-chess. Image légère, démarrage rapide.
 fastapi>=0.110
 uvicorn[standard]>=0.27
-python-multipart>=0.0.9   # parsing des uploads multipart (/upload, /model/publish)
+python-multipart>=0.0.32   # parsing des uploads multipart (/upload, /model/publish)
 python-chess>=1.999       # validation des FEN / coups des shards reçus
