@@ -119,7 +119,10 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
     max_samples = cfg["data"].get("max_train_samples")
     cap_txt = f" (plafond {max_samples} samples)" if max_samples else ""
     print(f"{len(shards)} shards trouvés. Chargement{cap_txt}…")
-    ds = ShardDataset(shards, max_samples=max_samples)
+    mask_policy = bool(tcfg.get("mask_policy_loss", False))
+    input_features = cfg.get("model", {}).get("input_features", "base")
+    ds = ShardDataset(shards, max_samples=max_samples,
+                      input_features=input_features, mask_policy=mask_policy)
     print(f"{len(ds)} samples chargés.")
 
     pin = device == "cuda"
@@ -205,11 +208,18 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
     t0 = time.time()
     running_p = running_v = 0.0
     while step < max_steps:
-        for planes, target_policy, target_val in loader:
+        for batch in loader:
+            if mask_policy:
+                planes, target_policy, legal_mask, target_val = batch
+            else:
+                planes, target_policy, target_val = batch
+                legal_mask = None
             planes = planes.to(device, non_blocking=True)
             if device == "cuda":
                 planes = planes.contiguous(memory_format=torch.channels_last)
             target_policy = target_policy.to(device, non_blocking=True)
+            if legal_mask is not None:
+                legal_mask = legal_mask.to(device, non_blocking=True)
             target_val = target_val.to(device, non_blocking=True)
 
             lr = lr_at_step(step, base_lr, warmup, max_steps, schedule)
@@ -219,7 +229,7 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
             opt.zero_grad(set_to_none=True)
             with autocast_ctx(device, use_amp, amp_dtype):
                 logits, value = model(planes)
-                loss_p = policy_loss(logits, target_policy, label_smooth)
+                loss_p = policy_loss(logits, target_policy, label_smooth, legal_mask)
                 loss_v = value_loss(value, target_val)
                 loss = loss_p + vlw * loss_v
 

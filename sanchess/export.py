@@ -38,7 +38,7 @@ from pathlib import Path
 
 import torch
 
-from .encoding import INPUT_PLANES
+from .encoding import input_planes_for_features
 from .model import build_model, build_model_from_checkpoint
 from .utils import load_checkpoint, load_config, load_model_state, resolve_device
 
@@ -61,7 +61,8 @@ def export_onnx(model, out_path: Path, device: str,
     """Exporte en ONNX avec un axe de batch DYNAMIQUE (batch 1..N supportés)."""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    dummy = torch.randn(sample_batch, INPUT_PLANES, 8, 8, device=device)
+    input_planes = input_planes_for_features(getattr(model, "input_features", "base"))
+    dummy = torch.randn(sample_batch, input_planes, 8, 8, device=device)
     dyn = {"board": {0: "batch"},
            "policy": {0: "batch"}, "value": {0: "batch"}}
     # dynamo=False : exporteur TorchScript historique (pas de dépendance onnxscript).
@@ -90,10 +91,11 @@ def compile_trt(model, device: str, fp16: bool = True,
     if not str(device).startswith("cuda"):
         raise RuntimeError("La compilation TensorRT exige un GPU CUDA (device=cuda).")
 
+    input_planes = input_planes_for_features(getattr(model, "input_features", "base"))
     inputs = [torch_tensorrt.Input(
-        min_shape=(min_batch, INPUT_PLANES, 8, 8),
-        opt_shape=(opt_batch, INPUT_PLANES, 8, 8),
-        max_shape=(max_batch, INPUT_PLANES, 8, 8),
+        min_shape=(min_batch, input_planes, 8, 8),
+        opt_shape=(opt_batch, input_planes, 8, 8),
+        max_shape=(max_batch, input_planes, 8, 8),
         dtype=torch.float32,
     )]
     enabled = {torch.float32}
@@ -109,6 +111,18 @@ def load_compiled(path: Path, device: str):
     except ImportError:
         pass
     return torch.jit.load(str(path), map_location=device).eval()
+
+
+class _InferenceWrapper(torch.nn.Module):
+    """Préserve les métadonnées d'encodage autour d'un module compilé."""
+
+    def __init__(self, module, input_features: str):
+        super().__init__()
+        self.module = module
+        self.input_features = input_features
+
+    def forward(self, x):
+        return self.module(x)
 
 
 def make_inference_model(cfg: dict, base_model, device: str):
@@ -127,6 +141,7 @@ def make_inference_model(cfg: dict, base_model, device: str):
         return base_model
     try:
         m = load_compiled(p, device)
+        m = _InferenceWrapper(m, getattr(base_model, "input_features", "base")).eval()
         sys.stderr.write(f"info string moteur TensorRT chargé : {p}\n")
         return m
     except Exception as e:  # noqa: BLE001 — repli robuste
@@ -159,9 +174,9 @@ def main() -> None:
         print(f"ONNX écrit : {out}")
         print("  -> moteur TensorRT : "
               f"trtexec --onnx={out} --fp16 --saveEngine={out.with_suffix('.plan')} "
-              f"--minShapes=board:1x{INPUT_PLANES}x8x8 "
-              f"--optShapes=board:{args.opt_batch}x{INPUT_PLANES}x8x8 "
-              f"--maxShapes=board:{args.max_batch}x{INPUT_PLANES}x8x8")
+              f"--minShapes=board:1x{input_planes_for_features(getattr(model, 'input_features', 'base'))}x8x8 "
+              f"--optShapes=board:{args.opt_batch}x{input_planes_for_features(getattr(model, 'input_features', 'base'))}x8x8 "
+              f"--maxShapes=board:{args.max_batch}x{input_planes_for_features(getattr(model, 'input_features', 'base'))}x8x8")
 
     if args.trt:
         compiled = compile_trt(model, device, fp16=args.fp16,

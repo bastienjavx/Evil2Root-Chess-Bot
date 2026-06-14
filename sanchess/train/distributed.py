@@ -145,7 +145,10 @@ def run(cfg: dict, shards_dir: str | None, args, resume: bool = True):
     if not shards:
         raise SystemExit("Aucun shard. Lance d'abord pgn_to_samples.")
     max_samples = cfg["data"].get("max_train_samples")
-    ds = ShardDataset(shards, max_samples=max_samples)
+    mask_policy = bool(tcfg.get("mask_policy_loss", False))
+    input_features = cfg.get("model", {}).get("input_features", "base")
+    ds = ShardDataset(shards, max_samples=max_samples,
+                      input_features=input_features, mask_policy=mask_policy)
     log(f"{len(ds)} samples chargés par rang.")
 
     sampler = DistributedSampler(ds, num_replicas=world, rank=rank,
@@ -158,6 +161,8 @@ def run(cfg: dict, shards_dir: str | None, args, resume: bool = True):
                         persistent_workers=nworkers > 0)
 
     model = build_model(cfg).to(device)
+    if device == "cuda":
+        model = model.to(memory_format=torch.channels_last)
     opt = torch.optim.AdamW(model.parameters(), lr=tcfg["lr"],
                             weight_decay=tcfg["weight_decay"])
     use_amp = amp_enabled(device, tcfg.get("amp", True))
@@ -198,9 +203,18 @@ def run(cfg: dict, shards_dir: str | None, args, resume: bool = True):
     while step < max_steps:
         if sampler is not None:
             sampler.set_epoch(epoch)
-        for planes, target_policy, target_val in loader:
+        for batch in loader:
+            if mask_policy:
+                planes, target_policy, legal_mask, target_val = batch
+            else:
+                planes, target_policy, target_val = batch
+                legal_mask = None
             planes = planes.to(device, non_blocking=True)
+            if device == "cuda":
+                planes = planes.contiguous(memory_format=torch.channels_last)
             target_policy = target_policy.to(device, non_blocking=True)
+            if legal_mask is not None:
+                legal_mask = legal_mask.to(device, non_blocking=True)
             target_val = target_val.to(device, non_blocking=True)
 
             lr = lr_at_step(step, base_lr, warmup, max_steps, schedule)
@@ -210,7 +224,7 @@ def run(cfg: dict, shards_dir: str | None, args, resume: bool = True):
             opt.zero_grad(set_to_none=True)
             with autocast_ctx(device, use_amp, amp_dtype):
                 logits, value = model(planes)
-                loss_p = policy_loss(logits, target_policy, label_smooth)
+                loss_p = policy_loss(logits, target_policy, label_smooth, legal_mask)
                 loss_v = value_loss(value, target_val)
                 loss = loss_p + vlw * loss_v
 

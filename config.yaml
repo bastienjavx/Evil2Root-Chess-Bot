@@ -1,10 +1,15 @@
 # Configuration San-o1 — IA d'échecs neuronale (AlphaZero/Lc0-like)
 
 model:
+  arch: v2                # v2 = résidus SE + attention globale + features tactiques
+  input_features: tactical # "base" (19 plans legacy) ou "tactical" (21 plans)
   channels: 256          # filtres des blocs résiduels (réseau agrandi)
   blocks: 20             # nombre de blocs résiduels (20x256 ~ petit Lc0)
   se: true               # blocs Squeeze-Excitation (recalibrage par canal, +force)
   se_ratio: 4            # ratio de réduction du MLP SE
+  attention_every: 5      # v2 : insère une attention globale toutes les N couches
+  attention_heads: 8      # v2 : doit diviser channels
+  attention_dropout: 0.0  # v2 : 0 pour garder l'inférence déterministe/rapide
   policy_head: conv      # "conv" (tête politique convolutive style Lc0, +force) ou "flat" (FC legacy)
   activation: mish       # "mish" (gain mesuré sur Lc0), "silu" ou "relu" (legacy)
   value_hidden: 256      # largeur de la couche cachée de la tête valeur
@@ -76,6 +81,7 @@ train:
   num_workers: 4         # workers DataLoader (réduire sur Mac M1 si RAM limitée)
   grad_clip: 1.0         # clip de la norme des gradients (0 = désactivé)
   label_smoothing: 0.02  # lissage de la cible politique (régularisation)
+  mask_policy_loss: true # CE politique uniquement sur coups légaux (alignée MCTS)
   warmup_steps: 2000     # montée linéaire du LR
   lr_schedule: cosine    # "cosine" (warmup + décroissance) ou "none"
   ema_decay: 0.0         # EMA des poids (ex. 0.999) ; 0 = désactivé

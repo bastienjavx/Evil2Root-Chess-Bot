@@ -55,6 +55,13 @@ class MoveReq(BaseModel):
     movetime: float | None = None
 
 
+class PgnReq(BaseModel):
+    moves: list[str] | None = None
+    white: str = "Humain"
+    black: str = "San-o1"
+    result: str | None = None
+
+
 def _board_from(fen: str | None, moves: list[str] | None) -> chess.Board:
     board = chess.Board(fen) if fen else chess.Board()
     for mv in (moves or []):
@@ -65,6 +72,10 @@ def _board_from(fen: str | None, moves: list[str] | None) -> chess.Board:
 def _run(fn, *a, **k):
     """Exécute un appel bloquant (MCTS/Torch) dans le threadpool."""
     return asyncio.get_event_loop().run_in_executor(None, lambda: fn(*a, **k))
+
+
+def _pgn_tag(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
 # --- API REST -----------------------------------------------------------------
@@ -141,6 +152,36 @@ async def api_move(req: MoveReq):
         res["is_game_over"] = board.is_game_over(claim_draw=True)
         res["result"] = board.result(claim_draw=True) if res["is_game_over"] else None
     return res
+
+
+@app.post("/api/pgn")
+def api_pgn(req: PgnReq):
+    try:
+        board = chess.Board()
+        sans = []
+        for uci in (req.moves or []):
+            mv = board.parse_uci(uci)
+            sans.append(board.san(mv))
+            board.push(mv)
+    except ValueError as exc:
+        return JSONResponse({"error": f"coups invalides : {exc}"}, status_code=400)
+
+    result = req.result or (board.result(claim_draw=True) if board.is_game_over(claim_draw=True) else "*")
+    headers = [
+        '[Event "San-o1 Web"]',
+        '[Site "San-o1"]',
+        f'[White "{_pgn_tag(req.white)}"]',
+        f'[Black "{_pgn_tag(req.black)}"]',
+        f'[Result "{result}"]',
+    ]
+    body = []
+    for i in range(0, len(sans), 2):
+        body.append(f"{i // 2 + 1}. {sans[i]}" + (f" {sans[i + 1]}" if i + 1 < len(sans) else ""))
+    return {
+        "fen": board.fen(),
+        "pgn": "\n".join(headers) + "\n\n" + " ".join(body + [result]),
+        "result": result,
+    }
 
 
 # --- WebSocket : partie humain vs modèle -------------------------------------

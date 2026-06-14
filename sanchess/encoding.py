@@ -18,7 +18,8 @@ import chess
 import numpy as np
 
 # --- Dimensions ---------------------------------------------------------------
-INPUT_PLANES = 19          # voir encode_board
+INPUT_PLANES = 19          # voir encode_board(features="base")
+TACTICAL_INPUT_PLANES = 21 # base + cartes d'attaques nous/adversaire
 POLICY_SIZE = 4672         # 64 * 73
 PLANES_PER_SQUARE = 73
 
@@ -136,10 +137,32 @@ def legal_move_indices(board: chess.Board) -> tuple[list[chess.Move], np.ndarray
     return moves, idx
 
 
-def encode_board(board: chess.Board) -> np.ndarray:
-    """Encode la position en (INPUT_PLANES, 8, 8) float32, repère canonique."""
+def legal_policy_mask(board: chess.Board) -> np.ndarray:
+    """Masque dense (POLICY_SIZE,) : True uniquement pour les coups légaux."""
+    mask = np.zeros(POLICY_SIZE, dtype=np.bool_)
+    _, idx = legal_move_indices(board)
+    mask[idx] = True
+    return mask
+
+
+def input_planes_for_features(features: str = "base") -> int:
+    """Nombre de plans d'entrée pour un jeu de features."""
+    if str(features).lower() == "tactical":
+        return TACTICAL_INPUT_PLANES
+    return INPUT_PLANES
+
+
+def encode_board(board: chess.Board, features: str = "base") -> np.ndarray:
+    """Encode la position en (C, 8, 8) float32, repère canonique.
+
+    `features="base"` garde les 19 plans historiques. `features="tactical"`
+    ajoute deux cartes d'attaque (cases attaquées par le trait / l'adversaire),
+    dérivées de la FEN à la volée : aucun changement du format de samples.
+    """
     turn = board.turn
-    planes = np.zeros((INPUT_PLANES, 8, 8), dtype=np.float32)
+    feature_mode = str(features).lower()
+    planes = np.zeros((input_planes_for_features(feature_mode), 8, 8),
+                      dtype=np.float32)
 
     for square, piece in board.piece_map().items():
         csq = _canon_square(square, turn)
@@ -169,5 +192,14 @@ def encode_board(board: chess.Board) -> np.ndarray:
         csq = _canon_square(board.ep_square, turn)
         r, f = divmod(csq, 8)
         planes[18, r, f] = 1.0
+
+    if feature_mode == "tactical":
+        for sq in chess.SQUARES:
+            csq = _canon_square(sq, turn)
+            r, f = divmod(csq, 8)
+            if board.is_attacked_by(turn, sq):
+                planes[19, r, f] = 1.0
+            if board.is_attacked_by(not turn, sq):
+                planes[20, r, f] = 1.0
 
     return planes

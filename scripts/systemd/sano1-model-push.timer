@@ -1,0 +1,12 @@
+[Unit]
+Description=San-o1 - Periodically push latest model checkpoint to GitHub
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+RandomizedDelaySec=2min
+Persistent=true
+Unit=sano1-model-push.service
+
+[Install]
+WantedBy=timers.target

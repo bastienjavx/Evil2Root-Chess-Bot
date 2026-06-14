@@ -18,6 +18,7 @@
   </div>
   <nav id="tabs">
     <button class="tab active" data-tab="play">Jouer</button>
+    <button class="tab" data-tab="analyze">Analyser</button>
     <button class="tab" data-tab="watch">Regarder</button>
     <button class="tab" data-tab="models">Modèles</button>
     <button class="tab" data-tab="train">Entraînement</button>
@@ -30,6 +31,11 @@
   <!-- ===================== JOUER ===================== -->
   <section id="play" class="panel active">
     <div class="board-col">
+      <div class="play-topline">
+        <span id="play-turn" class="pill">Trait —</span>
+        <span id="play-clock" class="pill">0.0s</span>
+        <span id="play-depth" class="pill">0 nœud</span>
+      </div>
       <div class="board-wrap">
         <div class="evalbar"><div class="evalbar-fill" id="play-eval"></div></div>
         <div id="play-board" class="board"></div>
@@ -38,6 +44,8 @@
         <button id="play-new" class="btn primary">Nouvelle partie</button>
         <button id="play-flip" class="btn">Retourner</button>
         <button id="play-undo" class="btn">Annuler</button>
+        <button id="play-copy-fen" class="btn">Copier FEN</button>
+        <button id="play-copy-pgn" class="btn">Copier PGN</button>
         <select id="play-side" class="sel">
           <option value="white">Je joue Blancs</option>
           <option value="black">Je joue Noirs</option>
@@ -63,16 +71,71 @@
         <div class="big" id="play-cp">—</div>
         <div class="muted">évaluation du modèle</div>
       </div>
+      <div class="mini-grid">
+        <div><span class="k">Win prob</span><strong id="play-wp">50%</strong></div>
+        <div><span class="k">NPS</span><strong id="play-nps">0</strong></div>
+        <div><span class="k">Modèle</span><strong id="play-current-model">—</strong></div>
+      </div>
       <h3>Réflexion du modèle</h3>
       <table class="moves-table" id="play-thinking"><tbody></tbody></table>
       <h3>Coups</h3>
       <div id="play-movelist" class="movelist"></div>
+      <textarea id="play-fen-box" class="fen-box" readonly></textarea>
+    </aside>
+  </section>
+
+  <!-- ===================== ANALYSER ===================== -->
+  <section id="analyze" class="panel">
+    <div class="board-col">
+      <div class="board-wrap">
+        <div class="evalbar"><div class="evalbar-fill" id="analyze-eval"></div></div>
+        <div id="analyze-board" class="board"></div>
+      </div>
+      <div class="board-controls">
+        <button id="analyze-run" class="btn primary">Analyser</button>
+        <button id="analyze-startpos" class="btn">Position initiale</button>
+        <button id="analyze-flip" class="btn">Retourner</button>
+      </div>
+      <div id="analyze-status" class="status">Collez un FEN ou analysez la position en cours.</div>
+    </div>
+    <aside class="side">
+      <h3>Position</h3>
+      <label>FEN
+        <textarea id="analyze-fen" class="fen-input"></textarea>
+      </label>
+      <label>Modèle
+        <select id="analyze-model" class="sel"></select>
+      </label>
+      <label>Budget
+        <select id="analyze-budget" class="sel">
+          <option value="nodes:400">400 nœuds</option>
+          <option value="nodes:1200" selected>1200 nœuds</option>
+          <option value="nodes:3000">3000 nœuds</option>
+          <option value="movetime:3">3 s</option>
+          <option value="movetime:8">8 s</option>
+        </select>
+      </label>
+      <div class="eval-readout">
+        <div class="big" id="analyze-cp">—</div>
+        <div class="muted"><span id="analyze-best">meilleur coup —</span></div>
+      </div>
+      <div class="mini-grid">
+        <div><span class="k">Win prob</span><strong id="analyze-wp">—</strong></div>
+        <div><span class="k">NPS</span><strong id="analyze-nps">0</strong></div>
+        <div><span class="k">Temps</span><strong id="analyze-time">0.0s</strong></div>
+      </div>
+      <h3>Lignes candidates</h3>
+      <table class="moves-table" id="analyze-thinking"><tbody></tbody></table>
     </aside>
   </section>
 
   <!-- ===================== REGARDER ===================== -->
   <section id="watch" class="panel">
     <div class="board-col">
+      <div class="play-topline">
+        <span id="watch-ply" class="pill">0 demi-coup</span>
+        <span id="watch-result" class="pill">en attente</span>
+      </div>
       <div class="board-wrap">
         <div class="evalbar"><div class="evalbar-fill" id="watch-eval"></div></div>
         <div id="watch-board" class="board"></div>
@@ -99,6 +162,10 @@
         <div class="big" id="watch-cp">—</div>
         <div class="muted">éval · <span id="watch-nps">0</span> nps</div>
       </div>
+      <div class="mini-grid">
+        <div><span class="k">Visites</span><strong id="watch-visits">0</strong></div>
+        <div><span class="k">Win prob</span><strong id="watch-wp">50%</strong></div>
+      </div>
       <h3>Réflexion</h3>
       <table class="moves-table" id="watch-thinking"><tbody></tbody></table>
       <h3>Coups</h3>
@@ -111,8 +178,12 @@
     <div class="wide">
       <div class="row-between">
         <h2>Checkpoints exposés</h2>
-        <button id="models-refresh" class="btn">Rafraîchir</button>
+        <div class="actions">
+          <input id="models-filter" class="search" placeholder="Filtrer">
+          <button id="models-refresh" class="btn">Rafraîchir</button>
+        </div>
       </div>
+      <div class="cards" id="models-summary"></div>
       <table class="data-table" id="models-table">
         <thead><tr>
           <th>Fichier</th><th>Step</th><th>Archi</th><th>Tête politique</th>
@@ -131,6 +202,7 @@
         <label class="inline-check"><input type="checkbox" id="train-auto" checked> auto-refresh</label>
       </div>
       <div class="cards" id="train-cards"></div>
+      <div id="train-logs" class="logline"></div>
       <div class="chart-card">
         <h3>Pré-entraînement — perte politique</h3>
         <svg id="chart-policy" class="chart" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
@@ -154,6 +226,8 @@
         <label class="inline-check"><input type="checkbox" id="sys-auto" checked> auto-refresh</label>
       </div>
       <div class="cards" id="sys-gpu"></div>
+      <h3>Entraînement</h3>
+      <div class="cards" id="sys-training"></div>
       <h3>Services systemd</h3>
       <div class="chips" id="sys-services"></div>
       <h3>Données</h3>

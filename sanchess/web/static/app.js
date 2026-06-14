@@ -7,6 +7,7 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const PIECES = { K:"♔",Q:"♕",R:"♖",B:"♗",N:"♘",P:"♙",
                  k:"♚",q:"♛",r:"♜",b:"♝",n:"♞",p:"♟" };
 const FILES = "abcdefgh";
+const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
 function conn(ok){ const c = $("#conn"); c.classList.toggle("ok", ok); }
 
@@ -16,6 +17,21 @@ async function api(path, opts){
     conn(r.ok);
     return await r.json();
   }catch(e){ conn(false); throw e; }
+}
+function esc(s){ return String(s??"").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function pct(x){ return `${Math.round(Math.max(0, Math.min(1, Number(x)||0))*100)}%`; }
+function fmtInt(x){ return Number(x||0).toLocaleString("fr-FR"); }
+function sideName(s){ return s==="white" ? "Blancs" : "Noirs"; }
+async function copyText(txt, msg){
+  try{
+    await navigator.clipboard.writeText(txt);
+    const st = $("#play-status");
+    const old = st.textContent;
+    st.textContent = msg || "Copié";
+    setTimeout(()=>{ if(st.textContent === (msg || "Copié")) st.textContent = old; }, 1400);
+  }catch(e){
+    $("#play-status").textContent = "Copie impossible dans ce navigateur.";
+  }
 }
 
 /* ---------------- Rendu de l'échiquier ---------------- */
@@ -72,22 +88,32 @@ async function loadModels(){
   MODELS = data.models;
   $("#device-badge").textContent = data.device;
   const opts = '<option value="latest">latest.pt (courant)</option>' +
-    MODELS.filter(m=>!m.is_latest).map(m=>`<option value="${m.name}">${m.name}${m.step!=null?` · step ${m.step}`:""}</option>`).join("");
-  for(const id of ["#play-model","#watch-white","#watch-black"]) $(id).innerHTML = opts;
+    MODELS.filter(m=>!m.is_latest).map(m=>`<option value="${esc(m.name)}">${esc(m.name)}${m.step!=null?` · step ${m.step}`:""}</option>`).join("");
+  for(const id of ["#play-model","#watch-white","#watch-black","#analyze-model"]) $(id).innerHTML = opts;
   renderModelsTable();
 }
 function renderModelsTable(){
   const tb = $("#models-table tbody");
+  const summary = $("#models-summary");
+  if(summary){
+    const total = MODELS.reduce((a,m)=>a+(m.size||0),0)/1e6;
+    summary.innerHTML = card("Checkpoints", fmtInt(MODELS.length))+
+      card("Latest step", MODELS.find(m=>m.is_latest)?.step ?? "—")+
+      card("Taille totale", total.toFixed(1)+" Mo");
+  }
   if(!MODELS.length){ tb.innerHTML='<tr><td colspan="8" class="empty">Aucun checkpoint.</td></tr>'; return; }
-  tb.innerHTML = MODELS.map(m=>`<tr>
-    <td>${m.name} ${m.is_latest?'<span class="badge latest">latest</span>':''}</td>
+  const q = ($("#models-filter")?.value || "").trim().toLowerCase();
+  const list = MODELS.filter(m=>!q || m.name.toLowerCase().includes(q) || String(m.step??"").includes(q));
+  if(!list.length){ tb.innerHTML='<tr><td colspan="8" class="empty">Aucun résultat.</td></tr>'; return; }
+  tb.innerHTML = list.map(m=>`<tr>
+    <td>${esc(m.name)} ${m.is_latest?'<span class="badge latest">latest</span>':''}</td>
     <td>${m.step??"—"}</td>
     <td>${m.channels?`${m.channels}×${m.blocks}${m.error?" ⚠":""}`:"—"}</td>
-    <td>${m.policy_head??"—"}</td>
-    <td>${m.activation??"—"}</td>
+    <td>${esc(m.policy_head??"—")}</td>
+    <td>${esc(m.activation??"—")}</td>
     <td>${m.size_mb} Mo</td>
     <td>${new Date(m.mtime*1000).toLocaleString()}</td>
-    <td><button class="btn" data-test="${m.name}">Tester</button></td>
+    <td><button class="btn" data-test="${esc(m.name)}">Tester</button></td>
   </tr>`).join("");
   $$("#models-table button[data-test]").forEach(b=>b.addEventListener("click",()=>{
     $("#play-model").value = b.dataset.test; switchTab("play"); newGame();
@@ -99,16 +125,17 @@ function renderThinking(el, top){
   const tb = el.querySelector("tbody");
   if(!top || !top.length){ tb.innerHTML=""; return; }
   const max = Math.max(...top.map(t=>t.visits), 1);
-  tb.innerHTML = top.map(t=>`<tr>
-    <td class="san">${t.san}</td>
+  tb.innerHTML = top.map((t,i)=>`<tr>
+    <td class="rank">${i+1}</td>
+    <td class="san">${esc(t.san)}</td>
     <td>${fmtCp(t.cp)}</td>
-    <td>${t.visits}</td>
+    <td>${fmtInt(t.visits)}</td>
     <td style="width:40%"><div class="bar" style="width:${(t.visits/max*100).toFixed(0)}%"></div></td>
   </tr>`).join("");
 }
 function pushMoveList(el, list){
   let html=""; for(let i=0;i<list.length;i+=2){
-    html+=`<span class="num">${i/2+1}.</span> <span class="mv">${list[i]||""}</span> <span class="mv">${list[i+1]||""}</span> `;
+    html+=`<span class="num">${i/2+1}.</span> <button class="mv" data-ply="${i+1}">${esc(list[i]||"")}</button> <button class="mv" data-ply="${i+2}">${esc(list[i+1]||"")}</button> `;
   }
   el.innerHTML = html; el.scrollTop = el.scrollHeight;
 }
@@ -117,17 +144,19 @@ function pushMoveList(el, list){
 const play = { startFen:null, moves:[], sans:[], side:"white", flip:false, legal:[], sel:null,
                fen:new Chess0(), busy:false };
 // État minimal : on garde le FEN courant renvoyé par le serveur.
-function Chess0(){ this.fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"; }
+function Chess0(){ this.fen = START_FEN; }
 
 function budget(id){ const [k,v]=$(id).value.split(":"); return k==="nodes"?{nodes:+v}:{movetime:+v}; }
 
 async function newGame(){
   play.moves=[]; play.sans=[]; play.sel=null; play.busy=false;
   play.side = $("#play-side").value; play.flip = play.side==="black";
-  play.fen.fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+  play.fen.fen = START_FEN;
   pushMoveList($("#play-movelist"), []);
   renderThinking($("#play-thinking"), []);
-  $("#play-cp").textContent="—"; setEval($("#play-eval"),.5);
+  $("#play-cp").textContent="—"; $("#play-wp").textContent="50%"; $("#play-nps").textContent="0";
+  $("#play-clock").textContent="0.0s"; $("#play-depth").textContent="0 nœud";
+  setEval($("#play-eval"),.5);
   await refreshLegal();
   $("#play-status").textContent = "À vous de jouer.";
   drawPlay();
@@ -140,6 +169,7 @@ async function refreshLegal(){
   play.legal = d.legal; play.fen.fen = d.fen; play.turn = d.turn;
   play.checkSq = d.in_check ? kingSquare(d.fen, d.turn) : null;
   play.over = d.is_game_over; play.result = d.result;
+  updatePlayMeta();
   return d;
 }
 function kingSquare(fen, turn){
@@ -153,6 +183,12 @@ function drawPlay(){
   renderBoard($("#play-board"), play.fen.fen, {
     flip:play.flip, lastMove:last, sel:play.sel, targets, checkSq:play.checkSq,
     onClick:onPlayClick });
+  $("#play-fen-box").value = play.fen.fen;
+}
+function updatePlayMeta(){
+  $("#play-turn").textContent = `Trait ${sideName(play.turn || "white")}`;
+  $("#play-current-model").textContent = $("#play-model").value || "latest";
+  $("#play-fen-box").value = play.fen.fen;
 }
 async function onPlayClick(sq, piece){
   if(play.busy||play.over) return;
@@ -193,6 +229,10 @@ async function modelMove(){
   setEval($("#play-eval"), wp);
   const cpWhite = play.turn==="white"? res.cp : -res.cp;
   $("#play-cp").textContent = fmtCp(cpWhite) + (res.step?`  ·  step ${res.step}`:"");
+  $("#play-wp").textContent = pct(wp);
+  $("#play-nps").textContent = fmtInt(res.nps);
+  $("#play-clock").textContent = `${(res.elapsed||0).toFixed(1)}s`;
+  $("#play-depth").textContent = `${fmtInt(res.root_visits)} nœuds`;
   if(res.bestmove){
     play.moves.push(res.bestmove); play.sans.push(res.bestmove_san);
     await refreshLegal(); pushMoveList($("#play-movelist"), play.sans);
@@ -207,12 +247,57 @@ function endPlay(){
   $("#play-status").textContent = `Fin de partie · ${txt} (${r})`;
 }
 
+async function copyPlayPgn(){
+  const white = play.side==="white" ? "Humain" : ($("#play-model").value || "San-o1");
+  const black = play.side==="black" ? "Humain" : ($("#play-model").value || "San-o1");
+  const d = await api("/api/pgn", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({moves:play.moves, white, black, result:play.result})});
+  if(d.error){ $("#play-status").textContent=d.error; return; }
+  await copyText(d.pgn, "PGN copié");
+}
+
+/* ================= ANALYSER (position libre) ================= */
+const analyze = { flip:false, fen:START_FEN };
+
+function drawAnalyze(fen=analyze.fen, lastMove=null){
+  analyze.fen = fen || START_FEN;
+  renderBoard($("#analyze-board"), analyze.fen, {flip:analyze.flip, lastMove});
+  $("#analyze-fen").value = analyze.fen;
+}
+
+async function runAnalyze(){
+  const fen = $("#analyze-fen").value.trim() || START_FEN;
+  $("#analyze-status").textContent = "Analyse en cours…";
+  renderThinking($("#analyze-thinking"), []);
+  let res;
+  try{
+    res = await api("/api/analyze", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({fen, model:$("#analyze-model").value, ...budget("#analyze-budget"), top_k:8})});
+  }catch(e){
+    $("#analyze-status").textContent = "Erreur de connexion au moteur.";
+    return;
+  }
+  if(res.error){ $("#analyze-status").textContent = res.error; return; }
+  drawAnalyze(res.fen, res.bestmove);
+  const wp = res.turn==="white" ? res.win_prob : 1-res.win_prob;
+  setEval($("#analyze-eval"), wp);
+  $("#analyze-cp").textContent = fmtCp(res.turn==="white" ? res.cp : -res.cp);
+  $("#analyze-best").textContent = res.bestmove_san ? `meilleur coup ${res.bestmove_san}` : "aucun coup";
+  $("#analyze-wp").textContent = pct(wp);
+  $("#analyze-nps").textContent = fmtInt(res.nps);
+  $("#analyze-time").textContent = `${(res.elapsed||0).toFixed(1)}s`;
+  renderThinking($("#analyze-thinking"), res.top_moves);
+  $("#analyze-status").textContent = `${fmtInt(res.root_visits)} visites · ${sideName(res.turn)} au trait`;
+}
+
 /* ================= REGARDER (selfplay streaming) ================= */
 let watchWs=null, watchMoves=[];
 function watchStart(){
   watchStop();
   watchMoves=[]; pushMoveList($("#watch-movelist"), []);
-  renderBoard($("#watch-board"), "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", {});
+  renderBoard($("#watch-board"), START_FEN, {});
+  $("#watch-ply").textContent = "0 demi-coup";
+  $("#watch-result").textContent = "en direct";
   const proto = location.protocol==="https:"?"wss:":"ws:";
   watchWs = new WebSocket(`${proto}//${location.host}/ws/selfplay`);
   $("#watch-start").disabled=true; $("#watch-stop").disabled=false;
@@ -230,11 +315,15 @@ function watchStart(){
       const wp = moverWasWhite? m.win_prob : 1-m.win_prob;
       setEval($("#watch-eval"), wp);
       const cpW = moverWasWhite? m.cp : -m.cp;
-      $("#watch-cp").textContent = fmtCp(cpW); $("#watch-nps").textContent = m.nps;
+      $("#watch-cp").textContent = fmtCp(cpW); $("#watch-nps").textContent = fmtInt(m.nps);
+      $("#watch-visits").textContent = fmtInt(m.visits);
+      $("#watch-wp").textContent = pct(wp);
+      $("#watch-ply").textContent = `${m.ply} demi-coup${m.ply>1?"s":""}`;
       renderThinking($("#watch-thinking"), m.top_moves);
       watchMoves.push(m.san); pushMoveList($("#watch-movelist"), watchMoves);
     } else if(m.type==="gameover"){
       $("#watch-status").textContent = `Fin · ${m.result} (${m.plies} demi-coups)`;
+      $("#watch-result").textContent = m.result;
       watchStop();
     } else if(m.type==="error"){ $("#watch-status").textContent="Erreur : "+m.error; watchStop(); }
   };
@@ -274,9 +363,10 @@ async function loadTraining(){
   if(o.steps.length){
     cards.innerHTML += card("Online step", o.steps[o.steps.length-1]);
     cards.innerHTML += card("Online loss", o.loss[o.loss.length-1].toFixed(4));
-    cards.innerHTML += card("Buffer", o.buffer[o.buffer.length-1].toLocaleString());
+    cards.innerHTML += card("Buffer", fmtInt(o.buffer[o.buffer.length-1]));
   }
   if(!cards.innerHTML) cards.innerHTML='<div class="empty">Aucun log d\'entraînement détecté dans data/.</div>';
+  $("#train-logs").textContent = [d.pretrain_log && `pretrain: ${d.pretrain_log}`, d.online_log && `online: ${d.online_log}`].filter(Boolean).join(" · ");
   lineChart($("#chart-policy"), p.steps, p.policy, "");
   lineChart($("#chart-value"), p.steps, p.value, "v");
   lineChart($("#chart-online"), o.steps, o.loss, "o");
@@ -302,10 +392,16 @@ async function loadSystem(){
   const da=d.data;
   $("#sys-data").innerHTML =
     card("Replay buffer", da.replay_buffer_files+" fichiers", `<div class="muted">${da.replay_buffer_mb} Mo</div>`)+
-    card("Shards", da.shard_files.toLocaleString());
+    card("Shards", fmtInt(da.shard_files));
+
+  const tr = d.training || {};
+  $("#sys-training").innerHTML =
+    (tr.pretrain ? card("Pretrain", `step ${fmtInt(tr.pretrain.step)}`, `<div class="muted">policy ${tr.pretrain.policy} · value ${tr.pretrain.value}</div>`) : "")+
+    (tr.online ? card("Online", `step ${fmtInt(tr.online.step)}`, `<div class="muted">loss ${tr.online.loss} · buffer ${fmtInt(tr.online.buffer)}</div>`) : "") ||
+    '<div class="empty">Aucun entraînement récent détecté.</div>';
 
   $("#sys-procs").innerHTML = d.processes.length? d.processes.map(p=>
-    `<span class="chip on"><span class="led"></span>${p.module} · pid ${p.pid}</span>`).join("")
+    `<span class="chip on"><span class="led"></span>${esc(p.module)} · pid ${p.pid}</span>`).join("")
     : '<div class="empty">Aucun process sanchess en cours.</div>';
 }
 
@@ -316,6 +412,7 @@ function switchTab(name){
   $$(".panel").forEach(p=>p.classList.toggle("active", p.id===name));
   for(const k in timers){ clearInterval(timers[k]); } timers={};
   if(name==="models") loadModels();
+  if(name==="analyze") drawAnalyze($("#analyze-fen").value || play.fen.fen || START_FEN);
   if(name==="train"){ loadTraining(); if($("#train-auto").checked) timers.t=setInterval(loadTraining,4000); }
   if(name==="system"){ loadSystem(); if($("#sys-auto").checked) timers.s=setInterval(loadSystem,3000); }
   if(name==="watch"){ /* prêt */ }
@@ -326,17 +423,32 @@ function init(){
   $$(".tab").forEach(t=>t.addEventListener("click",()=>switchTab(t.dataset.tab)));
   $("#play-new").addEventListener("click", newGame);
   $("#play-flip").addEventListener("click", ()=>{ play.flip=!play.flip; drawPlay(); });
+  $("#play-copy-fen").addEventListener("click", ()=>copyText(play.fen.fen, "FEN copié"));
+  $("#play-copy-pgn").addEventListener("click", copyPlayPgn);
   $("#play-undo").addEventListener("click", async ()=>{
     if(play.busy||play.moves.length<2) return;
     play.moves.splice(-2); play.sans.splice(-2); play.sel=null;
     await refreshLegal(); pushMoveList($("#play-movelist"),play.sans); drawPlay();
   });
   $("#play-side").addEventListener("change", newGame);
+  $("#play-model").addEventListener("change", updatePlayMeta);
+  $("#analyze-run").addEventListener("click", runAnalyze);
+  $("#analyze-startpos").addEventListener("click", ()=>{ drawAnalyze(START_FEN); setEval($("#analyze-eval"),.5); });
+  $("#analyze-flip").addEventListener("click", ()=>{ analyze.flip=!analyze.flip; drawAnalyze(analyze.fen); });
+  $("#analyze-fen").addEventListener("keydown", e=>{ if((e.ctrlKey||e.metaKey) && e.key==="Enter") runAnalyze(); });
   $("#watch-start").addEventListener("click", watchStart);
   $("#watch-stop").addEventListener("click", watchStop);
   $("#models-refresh").addEventListener("click", loadModels);
+  $("#models-filter").addEventListener("input", renderModelsTable);
   $("#train-auto").addEventListener("change", ()=>switchTab("train"));
   $("#sys-auto").addEventListener("change", ()=>switchTab("system"));
+  document.addEventListener("keydown", e=>{
+    if(e.target.matches("input,textarea,select")) return;
+    if(e.key==="n") newGame();
+    if(e.key==="f"){ play.flip=!play.flip; drawPlay(); }
+    if(e.key==="u") $("#play-undo").click();
+  });
+  drawAnalyze(START_FEN);
   loadModels().then(newGame);
 }
 document.addEventListener("DOMContentLoaded", init);

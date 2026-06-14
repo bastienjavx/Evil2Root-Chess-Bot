@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import Dataset
 
 from ..data.samples import _parse_policy
-from ..encoding import encode_board
+from ..encoding import encode_board, legal_policy_mask
 from .losses import dense_policy_target
 
 
@@ -39,7 +39,10 @@ class ShardDataset(Dataset):
     """
 
     def __init__(self, shard_paths: list[Path],
-                 max_samples: int | None = None, seed: int = 0):
+                 max_samples: int | None = None, seed: int = 0,
+                 input_features: str = "base", mask_policy: bool = False):
+        self.input_features = input_features
+        self.mask_policy = bool(mask_policy)
         paths = list(shard_paths)
         if max_samples:
             random.Random(seed).shuffle(paths)
@@ -74,11 +77,13 @@ class ShardDataset(Dataset):
         fen, move_uci, value = parts[0], parts[1], int(parts[2])
         pi = _parse_policy(parts[3]) if len(parts) > 3 else None
         board = chess.Board(fen)
-        planes = encode_board(board)
+        planes = encode_board(board, self.input_features)
         # Cible politique DENSE (POLICY_SIZE) : distribution de visites si dispo
         # (self-play), sinon one-hot du coup joué (samples humains) -> CE souple
         # identique à l'ancienne CE dure dans ce cas.
         policy = dense_policy_target(board, move_uci, pi)
-        return (torch.from_numpy(planes),
-                torch.from_numpy(policy),
-                torch.tensor(value, dtype=torch.float32))
+        out = [torch.from_numpy(planes), torch.from_numpy(policy)]
+        if self.mask_policy:
+            out.append(torch.from_numpy(legal_policy_mask(board)))
+        out.append(torch.tensor(value, dtype=torch.float32))
+        return tuple(out)

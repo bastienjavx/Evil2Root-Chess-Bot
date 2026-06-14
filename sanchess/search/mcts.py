@@ -76,6 +76,7 @@ class Evaluator:
     def __init__(self, model, device: str = "cuda"):
         self.device = device
         self._cuda = str(device).startswith("cuda")
+        self.input_features = getattr(model, "input_features", "base")
         # channels_last (NHWC) : sur tensor cores (Ampere/Ada/Hopper) les conv 2D
         # tournent nettement plus vite dans ce format. Mesuré H100 PCIe sur ce
         # réseau (24x320, SE) : +46 % de débit forward (26k -> 38k pos/s). C'est le
@@ -96,7 +97,7 @@ class Evaluator:
     @torch.no_grad()
     def evaluate(self, boards: list[chess.Board]):
         """Retourne une liste de (priors {move: prob}, value [-1,1] côté trait)."""
-        x = np.stack([encode_board(b) for b in boards])
+        x = np.stack([encode_board(b, self.input_features) for b in boards])
         t = torch.from_numpy(x).to(self.device)
         use_cuda = self._cuda
         if use_cuda:

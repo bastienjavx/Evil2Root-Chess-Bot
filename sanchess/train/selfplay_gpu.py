@@ -41,7 +41,7 @@ import chess
 import numpy as np
 
 from ..data.samples import write_samples
-from ..model import build_model
+from ..model import build_model, build_model_from_checkpoint
 from ..search.mcts import _Node, _terminal_value, select_child, Evaluator
 from ..utils import (load_checkpoint, load_config, load_model_state,
                      resolve_device)
@@ -379,7 +379,14 @@ def main() -> None:
     device = resolve_device(args.device or cfg.get("train", {}).get("device", "auto"))
     search_cfg = _build_search_cfg(cfg, args)
 
-    model = build_model(cfg)
+    latest = Path(cfg["paths"]["latest"])
+    if latest.exists():
+        ck = load_checkpoint(latest, device)
+        model = build_model_from_checkpoint(ck, fallback_cfg=cfg)
+        load_model_state(model, ck.get("raw_state", ck["model_state"]))
+        print(f"[selfplay_gpu] repris depuis {latest}", flush=True)
+    else:
+        model = build_model(cfg)
     if args.compile:
         try:
             import torch
@@ -388,7 +395,6 @@ def main() -> None:
         except Exception as e:
             print(f"[selfplay_gpu] torch.compile ignoré : {e}", flush=True)
     ev = Evaluator(model, device)
-    latest = Path(cfg["paths"]["latest"])
     mtime = _maybe_reload(model, latest, None, device)
 
     buffer_dir = Path(cfg["data"]["buffer_dir"])

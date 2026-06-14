@@ -53,9 +53,29 @@ def dense_policy_target(board, move_uci: str, pi: dict | None) -> np.ndarray:
 # --- Pertes (côté modèle) -----------------------------------------------------
 
 def policy_loss(logits: torch.Tensor, target: torch.Tensor,
-                label_smoothing: float = 0.0) -> torch.Tensor:
-    """Cross-entropy souple. `target` : (B, POLICY_SIZE) sommant à 1."""
-    if label_smoothing and label_smoothing > 0:
+                label_smoothing: float = 0.0,
+                legal_mask: torch.Tensor | None = None) -> torch.Tensor:
+    """Cross-entropy souple.
+
+    `target` : (B, POLICY_SIZE) sommant à 1 sur les coups observés. Si
+    `legal_mask` est fourni, les logits illégaux sont exclus du softmax et le
+    lissage est réparti uniquement sur les coups légaux.
+    """
+    # Sous AMP fp16, un masque à -1e9 overflow. La CE est de toute façon plus
+    # stable en fp32, comme les implémentations standard de cross-entropy.
+    logits = logits.float()
+    target = target.float()
+    if legal_mask is not None:
+        legal_mask = legal_mask.to(device=logits.device, dtype=torch.bool)
+        logits = logits.masked_fill(~legal_mask, -1e9)
+        target = target * legal_mask.to(dtype=target.dtype)
+        denom = target.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        target = target / denom
+        if label_smoothing and label_smoothing > 0:
+            legal = legal_mask.to(dtype=target.dtype)
+            k = legal.sum(dim=1, keepdim=True).clamp_min(1.0)
+            target = target * (1.0 - label_smoothing) + legal * (label_smoothing / k)
+    elif label_smoothing and label_smoothing > 0:
         k = target.shape[1]
         target = target * (1.0 - label_smoothing) + label_smoothing / k
     return -(target * F.log_softmax(logits, dim=1)).sum(dim=1).mean()

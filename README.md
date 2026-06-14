@@ -160,6 +160,28 @@ python -m sanchess.lichess_bot --check     # show account status (read-only)
 The collector feeds a replay buffer from live games while the trainer fine-tunes and refreshes
 `checkpoints/latest.pt`; the engine hot-reloads it between games.
 
+### 4a — Push the latest model to GitHub
+
+`checkpoints/latest.pt` is too large for normal Git commits, so the project can publish it
+as the `latest.pt` asset of a GitHub Release tagged `model-latest`:
+
+```bash
+# One-time setup on the machine that trains:
+gh auth login
+
+# Manual upload if the checkpoint changed:
+./scripts/push_latest_model.sh
+
+# Periodic upload through systemd:
+sudo cp scripts/systemd/sano1-model-push.* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now sano1-model-push.timer
+```
+
+The timer runs every 30 minutes by default. Override `GITHUB_MODEL_TAG`,
+`GITHUB_MODEL_ASSET_NAME`, `MODEL_PATH`, or `STABILITY_DELAY` in the service environment
+if you need a different release tag, asset name, checkpoint path, or stability wait.
+
 ### 4b — Opening book (stronger openings, no retraining)
 
 A standard **Polyglot** opening book plays known theory for the first moves and only hands

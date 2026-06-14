@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .encoding import INPUT_PLANES, PLANES_PER_SQUARE, POLICY_SIZE
+from .encoding import PLANES_PER_SQUARE, POLICY_SIZE, input_planes_for_features
 
 _ACTIVATIONS = {
     "relu": nn.ReLU,
@@ -91,13 +91,46 @@ class ResidualBlock(nn.Module):
         return self.act(out + x)
 
 
+class GlobalAttentionBlock(nn.Module):
+    """Attention globale sur les 64 cases, injectée entre blocs résiduels v2."""
+
+    def __init__(self, channels: int, heads: int = 8, dropout: float = 0.0,
+                 activation: str = "relu"):
+        super().__init__()
+        if channels % heads != 0:
+            raise ValueError("attention_heads doit diviser channels")
+        self.norm1 = nn.LayerNorm(channels)
+        self.attn = nn.MultiheadAttention(channels, heads, dropout=dropout,
+                                          batch_first=True)
+        self.norm2 = nn.LayerNorm(channels)
+        hidden = channels * 2
+        self.ff = nn.Sequential(
+            nn.Linear(channels, hidden),
+            _make_act(activation),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        tokens = x.flatten(2).transpose(1, 2)       # (B, 64, C)
+        y = self.norm1(tokens)
+        y, _ = self.attn(y, y, y, need_weights=False)
+        tokens = tokens + y
+        tokens = tokens + self.ff(self.norm2(tokens))
+        return tokens.transpose(1, 2).reshape(b, c, h, w)
+
+
 class SanChessNet(nn.Module):
-    """Entrée (B, INPUT_PLANES, 8, 8) -> (policy_logits (B, 4672), value (B, 1))."""
+    """Entrée (B, C, 8, 8) -> (policy_logits (B, 4672), value)."""
 
     def __init__(self, channels: int = 128, blocks: int = 10,
                  se: bool = False, se_ratio: int = 4, value_hidden: int = 256,
                  policy_head: str = "flat", value_channels: int = 8,
-                 activation: str = "relu", value_head: str = "scalar"):
+                 activation: str = "relu", value_head: str = "scalar",
+                 arch: str = "v1", input_features: str = "base",
+                 attention_every: int = 0, attention_heads: int = 8,
+                 attention_dropout: float = 0.0):
         super().__init__()
         if policy_head not in ("flat", "conv"):
             raise ValueError(f"policy_head inconnu: {policy_head!r} "
@@ -105,24 +138,41 @@ class SanChessNet(nn.Module):
         if value_head not in ("scalar", "wdl"):
             raise ValueError(f"value_head inconnu: {value_head!r} "
                              f"(choix: 'scalar', 'wdl')")
+        if arch not in ("v1", "v2"):
+            raise ValueError(f"arch inconnue: {arch!r} (choix: 'v1', 'v2')")
+        if arch == "v1":
+            attention_every = 0
+            input_features = "base"
+        input_planes = input_planes_for_features(input_features)
         self.cfg_meta = {"channels": channels, "blocks": blocks,
                          "se": se, "se_ratio": se_ratio,
                          "value_hidden": value_hidden,
                          "policy_head": policy_head,
                          "value_channels": value_channels,
                          "activation": activation,
-                         "value_head": value_head}
+                         "value_head": value_head,
+                         "arch": arch,
+                         "input_features": input_features,
+                         "attention_every": attention_every,
+                         "attention_heads": attention_heads,
+                         "attention_dropout": attention_dropout}
         self.policy_head = policy_head
         self.value_head = value_head
+        self.arch = arch
+        self.input_features = input_features
         self.stem = nn.Sequential(
-            nn.Conv2d(INPUT_PLANES, channels, 3, padding=1, bias=False),
+            nn.Conv2d(input_planes, channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(channels),
             _make_act(activation),
         )
-        self.tower = nn.Sequential(
-            *[ResidualBlock(channels, se=se, se_ratio=se_ratio,
-                            activation=activation) for _ in range(blocks)]
-        )
+        tower: list[nn.Module] = []
+        for i in range(blocks):
+            tower.append(ResidualBlock(channels, se=se, se_ratio=se_ratio,
+                                       activation=activation))
+            if attention_every and (i + 1) % attention_every == 0:
+                tower.append(GlobalAttentionBlock(channels, attention_heads,
+                                                  attention_dropout, activation))
+        self.tower = nn.Sequential(*tower)
 
         # Tête politique
         if policy_head == "conv":
@@ -195,25 +245,47 @@ class SanChessNet(nn.Module):
         return policy_logits, value
 
 
+class SanChessNetV2(SanChessNet):
+    """Réseau v2 : résidus SE + attention globale optionnelle + features riches."""
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("arch", "v2")
+        kwargs.setdefault("policy_head", "conv")
+        kwargs.setdefault("value_head", "wdl")
+        kwargs.setdefault("input_features", "tactical")
+        kwargs.setdefault("attention_every", 6)
+        super().__init__(**kwargs)
+
+
 def _model_kwargs(m: dict) -> dict:
     # Les défauts correspondent à l'architecture historique afin que les
     # checkpoints antérieurs (sans ces clés) soient reconstruits à l'identique.
+    arch = str(m.get("arch", "v1"))
+    is_v2 = arch == "v2"
     return {
         "channels": m.get("channels", 128),
         "blocks": m.get("blocks", 10),
         "se": bool(m.get("se", False)),
         "se_ratio": int(m.get("se_ratio", 4)),
         "value_hidden": int(m.get("value_hidden", 256)),
-        "policy_head": str(m.get("policy_head", "flat")),
+        "policy_head": str(m.get("policy_head", "conv" if is_v2 else "flat")),
         "value_channels": int(m.get("value_channels", 8)),
         "activation": str(m.get("activation", "relu")),
-        "value_head": str(m.get("value_head", "scalar")),
+        "value_head": str(m.get("value_head", "wdl" if is_v2 else "scalar")),
+        "arch": arch,
+        "input_features": str(m.get("input_features", "tactical" if is_v2 else "base")),
+        "attention_every": int(m.get("attention_every", 6 if is_v2 else 0)),
+        "attention_heads": int(m.get("attention_heads", 8)),
+        "attention_dropout": float(m.get("attention_dropout", 0.0)),
     }
 
 
 def build_model(cfg: dict) -> SanChessNet:
     """Construit le réseau d'après la section `model` de la config."""
-    return SanChessNet(**_model_kwargs(cfg.get("model", {})))
+    kwargs = _model_kwargs(cfg.get("model", {}))
+    if kwargs.get("arch") == "v2":
+        return SanChessNetV2(**kwargs)
+    return SanChessNet(**kwargs)
 
 
 def build_model_from_checkpoint(ckpt: dict, fallback_cfg: dict | None = None) -> SanChessNet:
@@ -224,4 +296,7 @@ def build_model_from_checkpoint(ckpt: dict, fallback_cfg: dict | None = None) ->
     courant. Repli sur la config fournie si le checkpoint n'embarque pas d'archi.
     """
     mcfg = ckpt.get("model_cfg") or (fallback_cfg or {}).get("model", {})
-    return SanChessNet(**_model_kwargs(mcfg))
+    kwargs = _model_kwargs(mcfg)
+    if kwargs.get("arch") == "v2":
+        return SanChessNetV2(**kwargs)
+    return SanChessNet(**kwargs)

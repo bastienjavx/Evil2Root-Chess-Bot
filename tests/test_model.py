@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import torch
 
-from sanchess.encoding import INPUT_PLANES, POLICY_SIZE
-from sanchess.model import (SanChessNet, build_model,
+from sanchess.encoding import INPUT_PLANES, POLICY_SIZE, TACTICAL_INPUT_PLANES
+from sanchess.model import (SanChessNet, SanChessNetV2, build_model,
                             build_model_from_checkpoint)
 from sanchess.utils import (amp_enabled, device_kind, load_model_state,
                             resolve_device)
@@ -56,6 +56,25 @@ def test_build_from_config_and_checkpoint():
     assert rebuilt.cfg_meta == net.cfg_meta
 
 
+def test_v2_forward_and_checkpoint_arch():
+    cfg = {"model": {"arch": "v2", "channels": 16, "blocks": 3, "se": True,
+                     "policy_head": "conv", "value_head": "wdl",
+                     "activation": "silu", "input_features": "tactical",
+                     "attention_every": 2, "attention_heads": 4}}
+    net = build_model(cfg).eval()
+    assert isinstance(net, SanChessNetV2)
+    x = torch.randn(2, TACTICAL_INPUT_PLANES, 8, 8)
+    with torch.no_grad():
+        logits, value = net(x)
+    assert logits.shape == (2, POLICY_SIZE)
+    assert value.shape == (2, 3)
+
+    ckpt = {"model_cfg": cfg["model"], "model_state": net.state_dict()}
+    rebuilt = build_model_from_checkpoint(ckpt, {})
+    rebuilt.load_state_dict(ckpt["model_state"])
+    assert rebuilt.cfg_meta["arch"] == "v2"
+
+
 def test_tolerant_load_across_architectures():
     """Charger des poids non-SE dans un réseau SE ne doit pas planter."""
     small = SanChessNet(channels=16, blocks=2, se=False)
@@ -86,6 +105,30 @@ def test_flatten_roundtrip():
         assert torch.allclose(a, b, atol=1e-6)
 
 
+def test_masked_policy_loss_ignores_illegal_logits():
+    from sanchess.train.losses import policy_loss
+
+    target = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    mask = torch.tensor([[True, True, False, False]])
+    logits_a = torch.tensor([[2.0, 0.5, 100.0, -100.0]])
+    logits_b = torch.tensor([[2.0, 0.5, -100.0, 100.0]])
+    loss_a = policy_loss(logits_a, target, legal_mask=mask)
+    loss_b = policy_loss(logits_b, target, legal_mask=mask)
+    assert torch.allclose(loss_a, loss_b, atol=1e-6)
+
+
+def test_masked_label_smoothing_only_uses_legal_moves():
+    from sanchess.train.losses import policy_loss
+
+    logits = torch.tensor([[0.0, 0.0, 50.0, 50.0]], requires_grad=True)
+    target = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    mask = torch.tensor([[True, True, False, False]])
+    loss = policy_loss(logits, target, label_smoothing=0.2, legal_mask=mask)
+    loss.backward()
+    assert logits.grad[0, 2].abs() == 0
+    assert logits.grad[0, 3].abs() == 0
+
+
 if __name__ == "__main__":
     test_forward_shapes()
     test_conv_policy_ordering()
@@ -93,4 +136,6 @@ if __name__ == "__main__":
     test_tolerant_load_across_architectures()
     test_resolve_device_and_helpers()
     test_flatten_roundtrip()
+    test_masked_policy_loss_ignores_illegal_logits()
+    test_masked_label_smoothing_only_uses_legal_moves()
     print("OK — tous les tests du modèle / distribué passent.")
