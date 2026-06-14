@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: ♟️ Jouer contre le bot
+    url: https://lichess.org/@/Evil2Root
+    about: Affronter @Evil2Root en direct sur Lichess.
+  - name: 📖 Documentation
+    url: https://github.com/bastienjavx/Evil2Root-Chess-Bot#readme
+    about: Lire le README et les guides (CLUSTER.md, CLOUD.md) avant d'ouvrir une issue.

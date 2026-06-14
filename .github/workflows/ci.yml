@@ -1,0 +1,73 @@
+name: CI
+
+# Intégration continue : lint + tests sur chaque push et pull request.
+# Tout tourne sur CPU (torch CPU). Les tests GPU/TensorRT/ONNX se skippent
+# proprement via pytest.importorskip / les replis CPU du code.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Annule les runs obsolètes d'une même branche/PR pour garder les files courtes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff
+
+      # Bloquant : uniquement les vraies erreurs (syntaxe, noms indéfinis, etc.).
+      - name: Ruff — erreurs critiques (bloquant)
+        run: ruff check --select E9,F63,F7,F82 --output-format=github .
+
+      # Informatif : le reste du style, sans faire échouer le build.
+      - name: Ruff — style complet (informatif)
+        run: ruff check --output-format=github .
+        continue-on-error: true
+
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies (torch CPU)
+        run: |
+          python -m pip install --upgrade pip
+          # torch CPU explicite : évite de tirer les wheels CUDA (lourds, inutiles en CI).
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          # Outils de test + ONNX pour couvrir tests/test_export.py.
+          pip install pytest onnx onnxruntime
+
+      - name: Run tests
+        run: python -m pytest tests/ -v

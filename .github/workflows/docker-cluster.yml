@@ -1,0 +1,50 @@
+name: Docker (coordinateur cluster)
+
+# Vérifie que l'image du coordinateur de cluster (Dockerfile.cluster, déployé sur
+# Railway) se construit toujours. Build seul — aucune publication d'image.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.cluster"
+      - "requirements-cluster.txt"
+      - "sanchess/cluster/**"
+      - ".dockerignore"
+      - ".github/workflows/docker-cluster.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "Dockerfile.cluster"
+      - "requirements-cluster.txt"
+      - "sanchess/cluster/**"
+      - ".dockerignore"
+  workflow_dispatch: {}
+
+concurrency:
+  group: docker-cluster-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (sans push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.cluster
+          push: false
+          load: true
+          tags: sano1-cluster:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

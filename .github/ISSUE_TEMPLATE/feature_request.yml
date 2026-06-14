@@ -1,0 +1,23 @@
+name: ✨ Demande de fonctionnalité
+description: Proposer une amélioration (force de jeu, training, outillage…)
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problème / motivation
+      description: Quel besoin ou quelle limite cette fonctionnalité adresse-t-elle ?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Solution proposée
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives envisagées

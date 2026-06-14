@@ -1,0 +1,54 @@
+name: 🐛 Rapport de bug
+description: Signaler un comportement incorrect du moteur, du bot ou du training
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Merci de prendre le temps de remplir ce rapport.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Que se passe-t-il ? À quoi t'attendais-tu ?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Étapes de reproduction
+      placeholder: |
+        1. Lancer `scripts/run_...`
+        2. …
+        3. Erreur observée
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Composant concerné
+      options:
+        - Moteur UCI (sanchess.uci)
+        - Bot Lichess (sanchess.lichess_bot)
+        - Pré-entraînement (train.pretrain)
+        - Apprentissage en ligne (train.online)
+        - Cluster / distribué
+        - Interface web (sanchess.web)
+        - Autre / inconnu
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Sortie pertinente (`journalctl -u <svc>`, traceback…).
+      render: shell
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environnement
+      placeholder: "OS, GPU, version Python, commit (`git rev-parse --short HEAD`)…"

@@ -8,6 +8,7 @@ AlphaZero/Lc0-style architecture — ResNet policy + value network, PUCT Monte-C
 supervised pre-training on Lichess games, and **continuous online learning** with live hot-reload.
 Ships as a **UCI engine** and a **native Lichess bot**.
 
+[![CI](https://github.com/bastienjavx/Evil2Root-Chess-Bot/actions/workflows/ci.yml/badge.svg)](https://github.com/bastienjavx/Evil2Root-Chess-Bot/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white)
 ![CUDA](https://img.shields.io/badge/CUDA-enabled-76B900?logo=nvidia&logoColor=white)

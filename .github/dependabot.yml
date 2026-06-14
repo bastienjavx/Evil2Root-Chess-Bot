@@ -1,0 +1,32 @@
+version: 2
+updates:
+  # Dépendances Python (pip).
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "python"]
+    commit-message:
+      prefix: "deps"
+
+  # Actions GitHub utilisées par les workflows CI/CD.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "ci"
+
+  # Image de base du coordinateur de cluster.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    labels: ["dependencies", "docker"]
+    commit-message:
+      prefix: "docker"
