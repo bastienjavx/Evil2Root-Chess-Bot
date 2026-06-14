@@ -15,5 +15,5 @@ pyyaml>=6.0.3
 tqdm>=4.66
 
 # Interface web (API REST + WebSocket + frontend) — sanchess.web
-fastapi>=0.110
+fastapi>=0.137.0
 uvicorn[standard]>=0.27
