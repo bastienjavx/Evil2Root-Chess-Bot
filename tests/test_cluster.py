@@ -185,6 +185,31 @@ def test_shards_listing_and_cursor(client):
     assert dl.status_code == 200 and len(dl.content) > 0
 
 
+def test_enriched_stats_fields(client):
+    c, _ = client
+    # un worker GPU contribue -> répartition matériel + compteurs horaires.
+    c.post("/cluster/work", json={"name": "gpuguy", "device": "cuda", "worker_id": "g1"})
+    _upload(c, _make_shard(n_games=2, plies=10), name="gpuguy", worker_id="g1")
+    s = c.get("/cluster/stats").json()
+    assert s["total_contributors"] >= 1
+    assert s["samples_last_hour"] == 20
+    assert s["games_last_hour"] == 2
+    assert s["uptime_sec"] >= 0
+    devs = {d["device"]: d for d in s["device_breakdown"]}
+    assert "cuda" in devs and devs["cuda"]["samples"] == 20
+
+
+def test_history_endpoint(client):
+    c, _ = client
+    assert c.get("/cluster/history").json()["series"] == []
+    _upload(c, _make_shard(n_games=3, plies=8), name="h", worker_id="h1")
+    hist = c.get("/cluster/history?minutes=60").json()
+    assert hist["minutes"] == 60
+    assert len(hist["series"]) == 1
+    pt = hist["series"][0]
+    assert pt["games"] == 3 and pt["samples"] == 24 and pt["cum_samples"] == 24
+
+
 def test_buffer_rotation_caps_shards(client):
     c, server = client
     for i in range(8):                        # MAX_SHARDS=5 (fixture)

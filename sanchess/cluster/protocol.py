@@ -18,6 +18,7 @@ EP_WORK = f"{API_PREFIX}/work"
 EP_UPLOAD = f"{API_PREFIX}/upload"
 EP_SHARDS = f"{API_PREFIX}/shards"
 EP_STATS = f"{API_PREFIX}/stats"
+EP_HISTORY = f"{API_PREFIX}/history"
 
 # --- Noms de fichiers / agencement du Volume ---------------------------------
 MODEL_FILENAME = "weights.pt"        # checkpoint weights-only servi aux workers
@@ -78,6 +79,7 @@ class ModelInfo:
     sha256: str = ""
     size: int = 0
     has_model: bool = False
+    published_at: float = 0.0    # epoch de la dernière publication (0 = jamais)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -106,12 +108,19 @@ class Stats:
     model_version: int = 0
     model_step: int = 0
     has_model: bool = False
+    model_published_at: float = 0.0
     total_games: int = 0
     total_samples: int = 0
+    total_contributors: int = 0
     active_workers: int = 0
     games_per_min: float = 0.0
+    games_last_hour: int = 0
+    samples_last_hour: int = 0
     pending_shards: int = 0
-    leaderboard: list = field(default_factory=list)  # [{name, games, samples}]
+    uptime_sec: float = 0.0
+    server_time: float = 0.0
+    device_breakdown: list = field(default_factory=list)  # [{device, workers, samples}]
+    leaderboard: list = field(default_factory=list)       # [{name, games, samples, device}]
 
     def to_dict(self) -> dict:
         return asdict(self)

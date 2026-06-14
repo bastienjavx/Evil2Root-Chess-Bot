@@ -74,6 +74,24 @@ DB_PATH = POOL_DIR / P.DB_FILENAME
 _db_lock = Lock()
 _rate: dict[str, deque] = {}          # IP -> timestamps récents (rate-limit upload)
 _games_log: deque = deque(maxlen=4000)  # timestamps des parties reçues (débit/min)
+# Séries temporelles en mémoire (réinitialisées au redémarrage : OK pour des courbes
+# « live ». Les totaux cumulés, eux, sont persistés en sqlite). Un seau par minute.
+HISTORY_MINUTES = int(os.environ.get("POOL_HISTORY_MINUTES", 360))
+_minute_buckets: deque = deque()      # [minute_epoch, games, samples]
+_START_TIME = time.time()
+
+
+def _record_activity(now: float, games: int, samples: int) -> None:
+    """Agrège l'activité dans le seau de la minute courante (pour les graphiques)."""
+    minute = int(now // 60) * 60
+    if _minute_buckets and _minute_buckets[-1][0] == minute:
+        _minute_buckets[-1][1] += games
+        _minute_buckets[-1][2] += samples
+    else:
+        _minute_buckets.append([minute, games, samples])
+    cutoff = minute - HISTORY_MINUTES * 60
+    while _minute_buckets and _minute_buckets[0][0] < cutoff:
+        _minute_buckets.popleft()
 
 
 def _connect() -> sqlite3.Connection:
@@ -306,6 +324,7 @@ async def upload(request: Request,
         conn.commit()
     for _ in range(n_games):
         _games_log.append(now)
+    _record_activity(now, n_games, n_samples)
 
     ack = P.UploadAck(ok=True, accepted_samples=n_samples, shard=fname,
                       total_samples=total[1], rank=better + 1)
@@ -345,7 +364,7 @@ async def model_publish(request: Request,
     os.replace(tmp, MODEL_PATH)
     prev = _read_model_info()
     info = P.ModelInfo(version=prev.version + 1, step=int(step), sha256=sha,
-                       size=len(raw), has_model=True)
+                       size=len(raw), has_model=True, published_at=time.time())
     _write_model_info(info)
     return info.to_dict()
 
@@ -365,11 +384,22 @@ def _snapshot_stats() -> P.Stats:
         board = conn.execute(
             "SELECT name, games, samples, device FROM contributors "
             "ORDER BY samples DESC LIMIT 20").fetchall()
+        devices = conn.execute(
+            "SELECT COALESCE(device,'?'), COUNT(*), COALESCE(SUM(samples),0) "
+            "FROM contributors GROUP BY device ORDER BY 3 DESC").fetchall()
     pending = len(list(INCOMING_DIR.glob("*.txt.gz")))
+    hour_ago = (int(now // 60) * 60) - 3600
+    games_hr = sum(b[1] for b in _minute_buckets if b[0] >= hour_ago)
+    samples_hr = sum(b[2] for b in _minute_buckets if b[0] >= hour_ago)
     return P.Stats(
         model_version=info.version, model_step=info.step, has_model=info.has_model,
-        total_games=agg[0], total_samples=agg[1], active_workers=active,
-        games_per_min=float(len(_games_log)), pending_shards=pending,
+        model_published_at=info.published_at,
+        total_games=agg[0], total_samples=agg[1], total_contributors=agg[2],
+        active_workers=active, games_per_min=float(len(_games_log)),
+        games_last_hour=games_hr, samples_last_hour=samples_hr,
+        pending_shards=pending, uptime_sec=now - _START_TIME, server_time=now,
+        device_breakdown=[{"device": d[0], "workers": d[1], "samples": d[2]}
+                          for d in devices],
         leaderboard=[{"name": r[0] or "anon", "games": r[1], "samples": r[2],
                       "device": r[3] or "?"} for r in board])
 
@@ -377,6 +407,23 @@ def _snapshot_stats() -> P.Stats:
 @app.get(P.EP_STATS)
 def stats():
     return _snapshot_stats().to_dict()
+
+
+@app.get(P.EP_HISTORY)
+def history(minutes: int = 180):
+    """Série temporelle par minute pour les graphiques (débit + croissance cumulée).
+    Réinitialisée au redémarrage du serveur (courbes 'live' ; les totaux persistent)."""
+    minutes = max(1, min(int(minutes), HISTORY_MINUTES))
+    now = time.time()
+    cutoff = (int(now // 60) * 60) - minutes * 60
+    cum = 0
+    series = []
+    # Cumul reconstruit sur la fenêtre conservée (point de départ relatif).
+    for ts, g, s in _minute_buckets:
+        cum += s
+        if ts >= cutoff:
+            series.append({"t": ts, "games": g, "samples": s, "cum_samples": cum})
+    return {"series": series, "server_time": now, "minutes": minutes}
 
 
 # --- Dashboard ----------------------------------------------------------------

@@ -4,47 +4,83 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>San-o1 · Cluster de calcul distribué</title>
+  <meta name="description" content="Tableau de bord public du cluster San-o1 : entraînement distribué d'un réseau de neurones d'échecs par self-play bénévole." />
   <link rel="stylesheet" href="/cluster/static/style.css" />
 </head>
 <body>
   <header>
-    <h1>♟ San-o1 — Cluster de calcul distribué</h1>
-    <p class="tagline">Apporte ta puissance (CPU · GPU NVIDIA · Mac M1) pour entraîner le réseau de neurones en continu.</p>
+    <div class="brand">
+      <h1>♟ San-o1</h1>
+      <span class="sub">Cluster de calcul distribué</span>
+    </div>
+    <div class="live">
+      <span class="dot" id="live-dot"></span>
+      <span id="live-text">connexion…</span>
+    </div>
   </header>
 
   <main>
-    <section class="cards">
-      <div class="card"><div class="num" id="model-version">—</div><div class="lbl">Version du modèle</div></div>
+    <p class="intro">
+      Réseau de neurones d'échecs (AlphaZero/Lc0) entraîné <strong>en continu</strong> par la
+      communauté : chaque machine (CPU · GPU NVIDIA · Mac M1) joue des parties contre elle-même
+      et renvoie les données. Plus il y a de monde, plus le modèle progresse vite.
+    </p>
+
+    <section class="cards" id="cards">
+      <div class="card accent"><div class="num" id="model-version">—</div><div class="lbl">Version du modèle</div></div>
       <div class="card"><div class="num" id="model-step">—</div><div class="lbl">Steps d'entraînement</div></div>
-      <div class="card"><div class="num" id="total-games">—</div><div class="lbl">Parties contribuées</div></div>
       <div class="card"><div class="num" id="total-samples">—</div><div class="lbl">Positions générées</div></div>
-      <div class="card"><div class="num" id="active-workers">—</div><div class="lbl">Workers actifs</div></div>
+      <div class="card"><div class="num" id="total-games">—</div><div class="lbl">Parties jouées</div></div>
+      <div class="card good"><div class="num" id="active-workers">—</div><div class="lbl">Workers actifs</div></div>
+      <div class="card"><div class="num" id="total-contributors">—</div><div class="lbl">Contributeurs</div></div>
       <div class="card"><div class="num" id="games-min">—</div><div class="lbl">Parties / min</div></div>
+      <div class="card"><div class="num" id="pending">—</div><div class="lbl">File d'entraînement</div></div>
     </section>
 
-    <section class="join">
-      <h2>Rejoindre le cluster</h2>
-      <p>Installe le client, puis lance un worker. Il détecte automatiquement ton matériel (CUDA / MPS / CPU) :</p>
-      <pre id="join-cmd"><code># 1. récupérer San-o1 + installer
-git clone &lt;repo San-o1&gt; &amp;&amp; cd San-o1
+    <section class="charts">
+      <div class="chart-box">
+        <div class="chart-head"><h2>Débit — parties / minute</h2><span class="badge" id="chart-rate-now">—</span></div>
+        <canvas id="chart-rate" height="160"></canvas>
+      </div>
+      <div class="chart-box">
+        <div class="chart-head"><h2>Positions générées (cumul récent)</h2><span class="badge" id="chart-cum-now">—</span></div>
+        <canvas id="chart-cum" height="160"></canvas>
+      </div>
+    </section>
+
+    <section class="split">
+      <div class="panel">
+        <h2>Matériel des contributeurs</h2>
+        <div id="devices" class="devices"><p class="muted">—</p></div>
+      </div>
+      <div class="panel join">
+        <h2>Rejoindre le cluster</h2>
+        <p class="muted">Détecte automatiquement ton matériel. Aucun compte requis :</p>
+        <pre id="join-cmd"><code>git clone &lt;repo San-o1&gt; &amp;&amp; cd San-o1
 pip install -r requirements.txt
-
-# 2. lancer un worker (remplace TonPseudo)
-python -m sanchess.cluster.worker --server <span id="server-url">SERVER_URL</span> --name "TonPseudo"</code></pre>
-      <button id="copy-btn">Copier la commande</button>
-      <p class="hint">Le worker télécharge le modèle courant, joue des parties contre lui-même (self-play MCTS) et renvoie les données. Plus il y a de monde, plus le réseau apprend vite.</p>
+python -m sanchess.cluster.worker \
+  --server <span id="server-url">SERVER_URL</span> \
+  --name "TonPseudo"</code></pre>
+        <button id="copy-btn">Copier la commande</button>
+      </div>
     </section>
 
-    <section class="board">
+    <section class="panel">
       <h2>Leaderboard</h2>
       <table id="leaderboard">
         <thead><tr><th>#</th><th>Contributeur</th><th>Matériel</th><th>Parties</th><th>Positions</th></tr></thead>
         <tbody></tbody>
       </table>
     </section>
-
-    <p class="status" id="status">Connexion…</p>
   </main>
+
+  <footer>
+    <span id="footer-status">—</span>
+    <span class="sep">·</span>
+    <span id="footer-uptime">—</span>
+    <span class="sep">·</span>
+    <a href="/cluster/stats">API stats</a>
+  </footer>
 
   <script src="/cluster/static/app.js"></script>
 </body>
