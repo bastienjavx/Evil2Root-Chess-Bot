@@ -107,22 +107,34 @@ class Engine:
             if remaining is not None:
                 max_seconds = max(0.05, remaining / 30.0)   # ~1/30 du temps restant
 
-        # Livre d'ouvertures : réponse immédiate tant qu'on est dans la théorie.
+        # Livre d'ouvertures. mode "play" : réponse immédiate tant qu'on est dans
+        # la théorie. mode "blend" : on récupère la distribution de théorie pour
+        # la mélanger aux priors du réseau dans le MCTS (livre + réseau ensemble).
+        book_priors = None
+        book_mix = 0.0
         if self.book is not None:
-            mv = self.book.lookup(self.board)
-            if mv is not None:
-                sys.stderr.write(f"info string livre {mv.uci()}\n")
-                return f"bestmove {mv.uci()}"
+            if self.book.mode == "play":
+                mv = self.book.lookup(self.board)
+                if mv is not None:
+                    sys.stderr.write(f"info string livre {mv.uci()}\n")
+                    return f"bestmove {mv.uci()}"
+            else:  # "blend"
+                book_priors = self.book.move_weights(self.board) or None
+                book_mix = self.book.mix
 
         num_nodes = nodes if nodes is not None else (
             10_000_000 if max_seconds is not None else self.default_nodes)
 
         # Réutilisation d'arbre : si la position courante descend (≤2 demi-coups)
-        # de la recherche précédente, on reprend ce sous-arbre comme racine.
+        # de la recherche précédente, on reprend ce sous-arbre comme racine. Le
+        # mélange du livre exige une racine fraîche (priors posés à l'expansion).
         reuse = None
-        if self.tree_reuse and self._prev_root is not None:
+        if book_priors is None and self.tree_reuse and self._prev_root is not None:
             reuse = self.mcts.advance_root(self._prev_root, self._prev_board, self.board)
-        root = self.mcts.run(self.board, num_nodes, max_seconds=max_seconds, root=reuse)
+        root = self.mcts.run(self.board, num_nodes, max_seconds=max_seconds, root=reuse,
+                             book_priors=book_priors, book_mix=book_mix)
+        if book_priors is not None:
+            sys.stderr.write("info string livre+réseau (priors mélangés)\n")
         if self.tree_reuse:
             self._prev_root = root
             self._prev_board = self.board.copy(stack=False)

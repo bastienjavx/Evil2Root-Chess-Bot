@@ -163,6 +163,20 @@ class MCTS:
             node.children[move] = _Node(p)
         node.expanded = True
 
+    @staticmethod
+    def _blend_book(root: _Node, book_priors: "dict | None", mix: float):
+        """Mélange les priors du livre d'ouvertures dans ceux du réseau à la
+        racine : prior <- (1-mix)*réseau + mix*livre. Les coups hors livre voient
+        seulement leur part réseau réduite -> la théorie est privilégiée mais la
+        recherche garde la liberté de l'écarter. No-op hors livre (priors vides)
+        ou mix<=0. Les priors restent normalisés (livre et réseau somment à 1)."""
+        mix = max(0.0, min(1.0, float(mix)))
+        if not book_priors or mix <= 0.0:
+            return
+        for move, child in root.children.items():
+            bp = book_priors.get(move, 0.0)
+            child.prior = (1.0 - mix) * child.prior + mix * bp
+
     def _add_dirichlet(self, root: _Node):
         if self.dir_eps <= 0 or not root.children:
             return
@@ -209,7 +223,8 @@ class MCTS:
     # --- Recherche ------------------------------------------------------------
     def run(self, board: chess.Board, num_nodes: int,
             max_seconds: float | None = None, *,
-            stop_event=None, root: "_Node | None" = None) -> _Node:
+            stop_event=None, root: "_Node | None" = None,
+            book_priors: "dict | None" = None, book_mix: float = 0.0) -> _Node:
         """Lance la recherche et renvoie la racine.
 
         - `stop_event` (threading.Event) : si fourni, la recherche s'arrête
@@ -218,6 +233,11 @@ class MCTS:
         - `root` : si fourni et déjà développé, on REPREND cet arbre au lieu d'en
           repartir d'un neuf (ponder hit : on capitalise les visites déjà faites
           pendant le tour de l'adversaire). Sinon on construit une racine fraîche.
+        - `book_priors` / `book_mix` : distribution {coup: prob} du livre
+          d'ouvertures et son poids dans le mélange (livre + réseau ENSEMBLE). Sur
+          une racine fraîche, le prior de chaque coup devient
+          `(1-mix)*réseau + mix*livre` -> la recherche neuronale privilégie la
+          théorie tout en pouvant l'écarter si le réseau la juge mauvaise.
         """
         if root is None or not root.expanded:
             root = _Node(0.0)
@@ -225,6 +245,7 @@ class MCTS:
             self._expand(root, root_priors)
             if not root.children:    # position terminale : aucun coup à chercher
                 return root
+            self._blend_book(root, book_priors, book_mix)
             self._add_dirichlet(root)
         # else : on reprend une racine déjà évaluée (ses stats N/W sont conservées).
 

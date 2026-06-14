@@ -38,6 +38,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -69,7 +70,9 @@ class MoveAnalysis:
     visit_counts: dict = field(default_factory=dict)  # {uci: visites} COMPLET
                           # (cible politique AlphaZero pour l'apprentissage sur
                           # les parties réelles du bot — cf. _record_game)
-    from_book: bool = False  # coup tiré du livre d'ouvertures (pas du MCTS)
+    from_book: bool = False  # coup JOUÉ directement depuis le livre (mode "play", sans MCTS)
+    book_guided: bool = False  # MCTS lancé avec les priors du livre (mode "blend" :
+                          # livre + réseau ensemble) -> le coup vient de la recherche
     ponder_move: "chess.Move | None" = None  # réponse adverse jugée la plus
                           # probable (2ᵉ ply de la PV) -> position à préparer en
                           # arrière-plan pendant que l'adversaire réfléchit.
@@ -211,16 +214,25 @@ class SearchEngine:
         # « ponder hit » : l'adversaire a joué le coup attendu, on reprend cet
         # arbre au lieu de repartir de zéro.
         pondered_fen, pondered_root = self.stop_ponder()
-        # Livre d'ouvertures : coup immédiat, sans MCTS ni GPU, tant qu'on est
-        # dans la théorie. `visit_counts` reste vide -> ces coups ne servent pas
-        # de cible d'apprentissage (on n'apprend pas du livre, on s'en sert).
+        # Livre d'ouvertures. Deux régimes (cf. book.mode) :
+        #   - "play"  : coup immédiat tiré du livre, sans MCTS ni GPU, tant qu'on
+        #               est dans la théorie. `visit_counts` reste vide -> ces coups
+        #               ne servent pas de cible d'apprentissage.
+        #   - "blend" : on récupère la distribution de théorie et on la mélangera
+        #               aux priors du réseau dans le MCTS ci-dessous -> livre ET
+        #               réseau décident ENSEMBLE. La recherche tourne donc même en
+        #               ouverture (et `visit_counts` est rempli -> on apprend).
+        book_priors = None
         if self.book is not None:
-            mv = self.book.lookup(board)
-            if mv is not None:
-                return MoveAnalysis(
-                    move=mv, move_san=board.san(mv), score=0.0, win=0.5,
-                    visits=0, pv_san=board.san(mv), top=[(board.san(mv), 0, 0.0)],
-                    step=self.step, from_book=True)
+            if self.book.mode == "play":
+                mv = self.book.lookup(board)
+                if mv is not None:
+                    return MoveAnalysis(
+                        move=mv, move_san=board.san(mv), score=0.0, win=0.5,
+                        visits=0, pv_san=board.san(mv), top=[(board.san(mv), 0, 0.0)],
+                        step=self.step, from_book=True)
+            else:  # "blend"
+                book_priors = self.book.move_weights(board) or None
         reuse = (pondered_root is not None and pondered_fen == board.fen()
                  and bool(pondered_root.children))
         start_root = pondered_root if reuse else None
@@ -229,14 +241,24 @@ class SearchEngine:
         if start_root is None and self.tree_reuse and self._last_real_root is not None:
             start_root = self.mcts.advance_root(
                 self._last_real_root, self._last_real_board, board)
+        # Le mélange livre↔réseau ne s'applique qu'à une racine FRAÎCHE (les priors
+        # sont posés à l'expansion). Si on dispose de coups de théorie, on repart
+        # donc d'une racine neuve pour les injecter, plutôt que de réutiliser un
+        # arbre où le biais du livre n'apparaîtrait pas (perte minime en ouverture).
+        book_mix = self.book.mix if self.book is not None else 0.0
+        if book_priors:
+            start_root = None
+            reuse = False
         nodes = 10_000_000 if think_seconds else self.default_nodes
         with self._gpu_for_real():
             root = self.mcts.run(board, nodes, max_seconds=think_seconds,
-                                 root=start_root)
+                                 root=start_root, book_priors=book_priors,
+                                 book_mix=book_mix)
         if self.tree_reuse:
             self._last_real_root = root
             self._last_real_board = board.copy(stack=False)
-        return self._summarize(root, board, ponder_hit=reuse)
+        return self._summarize(root, board, ponder_hit=reuse,
+                               book_guided=bool(book_priors))
 
     def choose_move(self, board: chess.Board, think_seconds: float | None):
         return self.analyze(board, think_seconds).move
@@ -332,7 +354,8 @@ class SearchEngine:
         mv, c = max(child.children.items(), key=lambda kv: kv[1].N)
         return mv if c.N > 0 else None
 
-    def _summarize(self, root, board: chess.Board, ponder_hit: bool = False) -> MoveAnalysis:
+    def _summarize(self, root, board: chess.Board, ponder_hit: bool = False,
+                   book_guided: bool = False) -> MoveAnalysis:
         mv = best_move(root)
         if mv is None:                              # position terminale
             return MoveAnalysis(None, "—", 0.0, 0.5, root.N, "", [], self.step)
@@ -355,6 +378,7 @@ class SearchEngine:
             visit_counts=visit_counts,
             ponder_move=self._predicted_reply(root, mv),
             ponder_hit=ponder_hit,
+            book_guided=book_guided,
         )
 
 
@@ -685,7 +709,12 @@ class LichessBot:
                         break
                     self._maybe_move(g, state)
             except Exception as e:
-                print(f"[partie {game_id}] erreur stream: {e}")
+                # On loggue la trace COMPLÈTE : l'erreur vient le plus souvent de
+                # la couche HTTP (Lichess ferme un flux inactif en correspondance)
+                # et la boucle se reconnecte juste après — mais sans la trace on ne
+                # peut pas distinguer ce cas bénin d'un vrai bug dans le traitement.
+                print(f"[partie {game_id}] erreur stream: {e!r}")
+                traceback.print_exc()
             if game_over:
                 break
             # Le flux s'est interrompu sans état terminal. Avant de boucler à
@@ -825,6 +854,9 @@ class LichessBot:
             return
         if analysis.from_book:
             print(f"[partie {g.id}] livre : {analysis.move_san}")
+        elif analysis.book_guided:
+            print(f"[partie {g.id}] livre+réseau : {analysis.move_san} "
+                  f"({analysis.visits} nœuds)")
 
         # Accepter une nulle proposée par l'adversaire si on n'est pas mieux.
         if self.accept_draw and self._opponent_offers_draw(state, g.my_color):
