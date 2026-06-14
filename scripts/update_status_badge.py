@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Génère les JSON shields.io (endpoint) de l'état d'entraînement et pousse
+le gist GitHub qui les héberge, pour des badges « temps réel » dans le README.
+
+Deux badges :
+  - training : phase courante (pretrain / online / idle) + step + métrique ;
+  - machine  : hostname de la machine qui entraîne + GPU + utilisation.
+
+L'ID du gist est lu dans $SANO1_STATUS_GIST puis dans scripts/status_gist_id.txt.
+Si aucun ID n'est trouvé et que --create est passé, un gist est créé et son ID
+écrit dans ce fichier. La mise à jour utilise la CLI `gh` (déjà authentifiée).
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+GIST_ID_FILE = ROOT / "scripts" / "status_gist_id.txt"
+
+TRAINING_FILE = "sano1-training.json"
+MACHINE_FILE = "sano1-machine.json"
+
+# shields.io clampe l'endpoint à >=300s ; on demande le minimum.
+CACHE_SECONDS = 300
+
+
+def _load_stats():
+    """Charge sanchess/web/stats.py sans importer le package (pas de torch)."""
+    path = ROOT / "sanchess" / "web" / "stats.py"
+    spec = importlib.util.spec_from_file_location("sano1_stats", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _fmt_step(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}k"
+    return str(n)
+
+
+def _short_gpu(name: str) -> str:
+    for prefix in ("NVIDIA GeForce ", "NVIDIA "):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def build_badges(stats) -> dict[str, dict]:
+    svc = {s["name"]: s for s in stats.services_status()}
+    summary = stats.training_summary()
+    gpus = stats.gpu_info()
+
+    train_active = svc.get("sano1-train", {}).get("active")
+    online_active = svc.get("sano1-online", {}).get("active")
+
+    # --- badge training ---
+    if train_active and "pretrain" in summary:
+        p = summary["pretrain"]
+        msg = f"pretrain · step {_fmt_step(p['step'])} · pol {p['policy']:.2f}"
+        color = "brightgreen"
+    elif online_active and "online" in summary:
+        o = summary["online"]
+        msg = f"online · step {_fmt_step(o['step'])} · loss {o['loss']:.2f}"
+        color = "brightgreen"
+    elif train_active or online_active:
+        msg = "starting…"
+        color = "yellow"
+    else:
+        msg = "idle"
+        color = "lightgrey"
+
+    training = {
+        "schemaVersion": 1,
+        "label": "training",
+        "message": msg,
+        "color": color,
+        "cacheSeconds": CACHE_SECONDS,
+    }
+
+    # --- badge machine ---
+    host = socket.gethostname()
+    if gpus:
+        g = gpus[0]
+        gpu_name = _short_gpu(g.get("name") or "GPU")
+        util = g.get("util_pct")
+        temp = g.get("temp_c")
+        bits = [host, gpu_name]
+        if util is not None:
+            bits.append(f"{util}%")
+        if temp is not None:
+            bits.append(f"{temp}°C")
+        mmsg = " · ".join(str(b) for b in bits)
+        # vert si la carte travaille, gris si oisive
+        mcolor = "blue" if (util or 0) >= 20 else "lightgrey"
+    else:
+        mmsg = f"{host} · no GPU"
+        mcolor = "lightgrey"
+
+    machine = {
+        "schemaVersion": 1,
+        "label": "machine",
+        "message": mmsg,
+        "color": mcolor,
+        "cacheSeconds": CACHE_SECONDS,
+    }
+    return {TRAINING_FILE: training, MACHINE_FILE: machine}
+
+
+def _read_gist_id() -> str | None:
+    import os
+    env = os.environ.get("SANO1_STATUS_GIST")
+    if env:
+        return env.strip()
+    if GIST_ID_FILE.exists():
+        v = GIST_ID_FILE.read_text().strip()
+        if v:
+            return v
+    return None
+
+
+def _write_files(badges: dict[str, dict], dest: Path) -> None:
+    for name, payload in badges.items():
+        (dest / name).write_text(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _create_gist(badges: dict[str, dict]) -> str:
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        _write_files(badges, d)
+        files = [str(d / n) for n in badges]
+        out = subprocess.run(
+            ["gh", "gist", "create", "--public",
+             "--desc", "San-o1 live training status (shields.io endpoints)",
+             *files],
+            capture_output=True, text=True, check=True).stdout.strip()
+    gid = out.rstrip("/").split("/")[-1]
+    GIST_ID_FILE.write_text(gid + "\n")
+    return gid
+
+
+def _update_gist(gid: str, badges: dict[str, dict]) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        _write_files(badges, d)
+        for name in badges:
+            subprocess.run(
+                ["gh", "gist", "edit", gid, "-f", name, str(d / name)],
+                capture_output=True, text=True, check=True)
+
+
+def _gist_user() -> str:
+    return subprocess.run(["gh", "api", "user", "-q", ".login"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--create", action="store_true",
+                    help="créer le gist s'il n'existe pas et afficher les URLs")
+    ap.add_argument("--print-urls", action="store_true",
+                    help="afficher les URLs shields.io et quitter")
+    args = ap.parse_args()
+
+    stats = _load_stats()
+    badges = build_badges(stats)
+
+    gid = _read_gist_id()
+    if gid is None:
+        if not args.create:
+            print("Aucun gist configuré. Lancer une fois avec --create.",
+                  file=sys.stderr)
+            return 2
+        gid = _create_gist(badges)
+        print(f"Gist créé : {gid}")
+    else:
+        _update_gist(gid, badges)
+
+    if args.create or args.print_urls:
+        user = _gist_user()
+        for name in (TRAINING_FILE, MACHINE_FILE):
+            raw = f"https://gist.githubusercontent.com/{user}/{gid}/raw/{name}"
+            shield = f"https://img.shields.io/endpoint?url={raw}"
+            print(f"{name}: {shield}")
+    print(f"[badge] {time.strftime('%H:%M:%S')} "
+          f"{badges[TRAINING_FILE]['message']} | {badges[MACHINE_FILE]['message']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

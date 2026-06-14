@@ -14,6 +14,11 @@ Ships as a **UCI engine** and a **native Lichess bot**.
 ![Lichess](https://img.shields.io/badge/Lichess-BOT_API-000000?logo=lichess&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
+**Live status** (auto-updated from the training machine)
+
+![Training](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/bastienjavx/06cb7d671c6dcf1aa82b7e9921f83c1b/raw/sano1-training.json)
+![Machine](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/bastienjavx/06cb7d671c6dcf1aa82b7e9921f83c1b/raw/sano1-machine.json)
+
 </div>
 
 ---

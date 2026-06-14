@@ -1,0 +1,14 @@
+[Unit]
+Description=San-o1 - Push live training status to GitHub gist (README badges)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=evil2root
+Group=evil2root
+WorkingDirectory=/home/evil2root/Bureau/San-o1
+ExecStart=/home/evil2root/Bureau/San-o1/scripts/update_status_badge.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sano1-status-badge
