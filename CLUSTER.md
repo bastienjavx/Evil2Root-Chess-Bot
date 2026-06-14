@@ -92,13 +92,24 @@ Options utiles :
 | Option | Effet |
 |---|---|
 | `--device auto` | `cuda` > `mps` (Mac M1) > `cpu` (défaut) |
-| `--workers 4` | (CPU) lance N processus de self-play en parallèle |
-| `--threads 1` | threads torch par worker CPU (1 = un cœur/worker) |
+| `--workers auto` | utilise presque tous les cœurs (`cpu_count - reserve_cores`) ; défaut agressif |
+| `--workers 4` | force N processus de self-play en parallèle |
+| `--threads auto` | threads torch par worker (`auto` = 1, recommandé pour éviter la sur-souscription) |
+| `--reserve-cores 2` | garde N cœurs libres quand `--workers auto` |
+| `--gpu-games 512` | budget total de parties GPU batchées sur cette machine, réparti entre les workers |
+| `--gpu-leaves 8` | feuilles GPU par partie (surcharge locale de `JOB_GPU_LEAVES`) |
 | `--nice 10` | priorité basse : ne fige pas le poste |
 | `--once` | un seul lot puis arrêt (test) |
 
-- **GPU CUDA** : self-play batché (des dizaines de parties par forward) — laisse `--workers 1`.
-- **Mac M1 / CPU** : `play_game` séquentiel ; augmente `--workers` pour utiliser plus de cœurs.
+Les mêmes réglages existent en variables d'environnement locales :
+`SANO1_WORKER_WORKERS`, `SANO1_WORKER_THREADS`, `SANO1_WORKER_RESERVE_CORES`,
+`SANO1_WORKER_GPU_GAMES`, `SANO1_WORKER_GPU_LEAVES`, `SANO1_WORKER_DEVICE`,
+`SANO1_WORKER_NICE`.
+
+- **GPU CUDA** : le worker peut lancer plusieurs process pour saturer le MCTS Python ;
+  le budget `gpu_games` est réparti entre eux pour éviter de multiplier la VRAM par accident.
+- **Mac M1 / CPU** : `play_game` séquentiel par process ; le mode `auto` utilise les cœurs
+  disponibles avec un cœur réservé par défaut.
 
 Le worker télécharge le modèle courant (revérifié par sha256), joue jusqu'à
 `JOB_TARGET_SAMPLES` positions, renvoie le shard, et recommence. Reconnexion + backoff

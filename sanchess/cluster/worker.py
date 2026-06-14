@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import io
+import math
 import os
 import tempfile
 import time
@@ -33,6 +33,72 @@ def _cache_dir() -> Path:
                             Path.home() / ".cache" / "sano1_cluster"))
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+# --- Dimensionnement local ----------------------------------------------------
+
+_AUTO = "auto"
+
+
+def _auto_default(env_name: str, default: str) -> str:
+    return os.environ.get(env_name, default)
+
+
+def _parse_positive_int_or_auto(value, *, name: str) -> int | None:
+    """Parse une option positive ou 'auto'. Retourne None pour auto."""
+    if isinstance(value, int):
+        n = value
+    else:
+        text = str(value or _AUTO).strip().lower()
+        if text in ("", _AUTO):
+            return None
+        try:
+            n = int(text)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"{name} doit être un entier positif ou 'auto'"
+            ) from exc
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"{name} doit être >= 1")
+    return n
+
+
+def _resolve_workers(value, reserve_cores: int, cpu_count: int | None = None) -> int:
+    explicit = _parse_positive_int_or_auto(value, name="workers")
+    if explicit is not None:
+        return explicit
+    ncpu = int(cpu_count or os.cpu_count() or 1)
+    reserve = max(0, int(reserve_cores))
+    return max(1, ncpu - reserve)
+
+
+def _resolve_threads(value) -> int:
+    explicit = _parse_positive_int_or_auto(value, name="threads")
+    return explicit if explicit is not None else 1
+
+
+def _resolve_optional_positive(value, *, name: str) -> int | None:
+    return _parse_positive_int_or_auto(value, name=name)
+
+
+def _split_gpu_games(total_games: int, workers: int) -> int:
+    return max(1, int(math.ceil(max(1, total_games) / max(1, workers))))
+
+
+def _configure_thread_env() -> None:
+    """Un process worker = un cœur Python ; éviter les pools BLAS par process."""
+    for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(key, "1")
+
+
+def _apply_local_job_overrides(job: P.JobSpec, args, kind: str) -> P.JobSpec:
+    if kind == "cuda":
+        total_games = int(args.gpu_games_total or job.gpu_games)
+        job.gpu_games = _split_gpu_games(total_games, int(args.workers))
+        if args.gpu_leaves_per_game:
+            job.gpu_leaves_per_game = int(args.gpu_leaves_per_game)
+    return job
 
 
 # --- Synchronisation du modèle ------------------------------------------------
@@ -69,6 +135,8 @@ class ModelSync:
         info = self._current()
         if not info.has_model:
             if self.model is None:                 # rien à télécharger : réseau frais
+                print("[worker] aucun modèle publié sur le serveur ; "
+                      "initialisation d'un réseau frais local", flush=True)
                 self.model = build_model(self.fallback_cfg)
                 self.evaluator = Evaluator(self.model, self.device)
                 self.version = 0
@@ -77,7 +145,10 @@ class ModelSync:
             return info                            # déjà à jour
 
         path = self.cache / f"weights_v{info.version}.pt"
-        if not (path.exists() and _sha256_file(path) == info.sha256):
+        cached = path.exists() and _sha256_file(path) == info.sha256
+        if not cached:
+            print(f"[worker] téléchargement du modèle v{info.version} "
+                  f"({info.size // 1024} Ko)", flush=True)
             r = requests.get(self.server + P.EP_MODEL_DOWNLOAD, timeout=120)
             r.raise_for_status()
             if info.sha256 and hashlib.sha256(r.content).hexdigest() != info.sha256:
@@ -85,6 +156,9 @@ class ModelSync:
             tmp = path.with_suffix(".pt.part")
             tmp.write_bytes(r.content)
             os.replace(tmp, path)
+        else:
+            print(f"[worker] modèle v{info.version} trouvé dans le cache local",
+                  flush=True)
 
         ck = load_checkpoint(path, self.device)
         self.model = build_model_from_checkpoint(ck, fallback_cfg=self.fallback_cfg)
@@ -163,8 +237,8 @@ def run_loop(args, wid: str) -> None:
     cfg = load_config(args.config) if args.config else load_config()
     device = resolve_device(args.device)
     kind = device_kind(device)
-    if kind == "cpu":
-        torch.set_num_threads(max(1, int(args.threads)))
+    torch.set_num_threads(max(1, int(args.threads)))
+    if kind in ("cpu", "mps"):
         try:
             os.nice(int(args.nice))                # priorité basse : ne fige pas le poste
         except (OSError, AttributeError):
@@ -173,7 +247,9 @@ def run_loop(args, wid: str) -> None:
     server = args.server.rstrip("/")
     sync = ModelSync(server, _cache_dir(), cfg, device)
     print(f"[worker {wid[:8]}] device={device} ({kind}) serveur={server} "
-          f"pseudo={args.name!r}", flush=True)
+          f"pseudo={args.name!r} | puissance={args.power_profile} "
+          f"workers={args.workers} threads={args.threads} "
+          f"reserve_cores={args.reserve_cores}", flush=True)
 
     backoff = 2.0
     while True:
@@ -186,12 +262,17 @@ def run_loop(args, wid: str) -> None:
             payload = r.json()
             wid = payload.get("worker_id", wid)
             job = P.JobSpec.from_dict(payload.get("job", {}))
+            job = _apply_local_job_overrides(job, args, kind)
 
             # 2. modèle à jour.
             sync.ensure_latest()
 
             # 3. jouer.
             t0 = time.time()
+            if kind == "cuda":
+                print(f"[worker {wid[:8]}] job: nodes={job.nodes} "
+                      f"gpu_games={job.gpu_games} leaves={job.gpu_leaves_per_game} "
+                      f"target_samples={job.target_samples}", flush=True)
             rows = _play_gpu(sync, job, cfg) if kind == "cuda" else _play_cpu(sync, job, cfg)
 
             # 4. renvoyer.
@@ -218,17 +299,48 @@ def main() -> None:
     ap.add_argument("--server", required=True, help="URL du coordinateur (Railway)")
     ap.add_argument("--name", default=os.environ.get("SANO1_WORKER_NAME", "anon"),
                     help="pseudo affiché au leaderboard")
-    ap.add_argument("--device", default="auto", help="auto / cuda / mps / cpu")
+    ap.add_argument("--device", default=os.environ.get("SANO1_WORKER_DEVICE", "auto"),
+                    help="auto / cuda / mps / cpu")
     ap.add_argument("--config", default=None, help="config.yaml (mcts/model fallback)")
-    ap.add_argument("--workers", type=int, default=1,
-                    help="processus de self-play parallèles (CPU). GPU : laisser 1 "
-                         "(le batch interne parallélise déjà des dizaines de parties).")
-    ap.add_argument("--threads", type=int, default=1,
-                    help="threads torch par worker CPU (1 = un cœur/worker)")
-    ap.add_argument("--nice", type=int, default=10, help="priorité CPU (anti-freeze)")
+    ap.add_argument("--workers", default=_auto_default("SANO1_WORKER_WORKERS", _AUTO),
+                    help="'auto' utilise presque tous les cœurs, ou un entier explicite")
+    ap.add_argument("--threads", default=_auto_default("SANO1_WORKER_THREADS", _AUTO),
+                    help="threads torch par process ('auto' = 1)")
+    ap.add_argument("--reserve-cores", type=int,
+                    default=int(os.environ.get("SANO1_WORKER_RESERVE_CORES", "1")),
+                    dest="reserve_cores",
+                    help="cœurs gardés libres quand --workers=auto")
+    ap.add_argument("--gpu-games", default=_auto_default("SANO1_WORKER_GPU_GAMES", _AUTO),
+                    dest="gpu_games",
+                    help="parties GPU batchées au total sur cette machine ('auto' = job serveur)")
+    ap.add_argument("--gpu-leaves", default=_auto_default("SANO1_WORKER_GPU_LEAVES", _AUTO),
+                    dest="gpu_leaves",
+                    help="feuilles GPU par partie ('auto' = job serveur)")
+    ap.add_argument("--nice", type=int,
+                    default=int(os.environ.get("SANO1_WORKER_NICE", "10")),
+                    help="priorité CPU/MPS (anti-freeze)")
     ap.add_argument("--once", action="store_true",
                     help="un seul lot puis arrêt (debug / test)")
     args = ap.parse_args()
+
+    args.power_profile = "auto-agressif"
+    try:
+        args.workers = _resolve_workers(args.workers, args.reserve_cores)
+        args.threads = _resolve_threads(args.threads)
+        args.gpu_games_total = _resolve_optional_positive(args.gpu_games,
+                                                          name="gpu-games")
+        args.gpu_leaves_per_game = _resolve_optional_positive(args.gpu_leaves,
+                                                              name="gpu-leaves")
+    except argparse.ArgumentTypeError as exc:
+        ap.error(str(exc))
+    _configure_thread_env()
+
+    print("[worker] configuration locale : "
+          f"workers={args.workers} threads={args.threads} "
+          f"reserve_cores={args.reserve_cores} "
+          f"gpu_games={args.gpu_games_total or 'serveur'} "
+          f"gpu_leaves={args.gpu_leaves_per_game or 'serveur'}",
+          flush=True)
 
     if args.workers <= 1:
         run_loop(args, uuid.uuid4().hex)
