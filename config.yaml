@@ -54,8 +54,17 @@ train:
   weight_decay: 0.0001
   value_loss_weight: 1.0
   amp: true              # mixed precision (CUDA uniquement ; ignoré sur MPS/CPU)
+  amp_dtype: fp16        # "fp16" (+ GradScaler) ou "bf16". La 2070S (Turing, compute
+                         # 7.5) N'A PAS de bf16 matériel -> garder fp16 ici. Demander
+                         # "bf16" retombe AUTOMATIQUEMENT sur fp16 si non supporté.
+  compile: false         # torch.compile (max-autotune) : gros gain sur Ampere+/H100,
+                         # peu d'intérêt sur Turing -> false en local (true en cloud).
+  prefetch_factor: 4     # batchs DataLoader pré-chargés par worker (défaut PyTorch=2)
   pretrain_steps: 1000000
   checkpoint_every: 2000
+  keep_last_checkpoints: 20  # rotation : ne garde que les N derniers step_*.pt
+                             # (~0.5 Go pièce avec l'optimiseur). 0 = tout garder.
+                             # latest.pt / ref_strength.pt jamais supprimés.
   log_every: 50
   num_workers: 4         # workers DataLoader (réduire sur Mac M1 si RAM limitée)
   grad_clip: 1.0         # clip de la norme des gradients (0 = désactivé)

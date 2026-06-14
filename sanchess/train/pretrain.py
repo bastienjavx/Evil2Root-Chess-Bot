@@ -23,7 +23,8 @@ from torch.utils.data import DataLoader
 
 from ..model import build_model
 from ..utils import (amp_enabled, autocast_ctx, load_checkpoint, load_config,
-                     load_model_state, resolve_device, save_checkpoint)
+                     load_model_state, resolve_amp_dtype, resolve_device,
+                     save_checkpoint, unwrap_model)
 from .dataset import ShardDataset, find_shards
 from .losses import policy_loss, value_loss
 
@@ -62,9 +63,36 @@ class EMA:
         return out
 
 
+def _prune_checkpoints(ckpt_dir: Path, keep: int) -> None:
+    """Ne conserve que les `keep` snapshots `step_*.pt` les plus récents (par numéro
+    de step). Chaque .pt pèse ~0.5 Go (état optimiseur inclus) : sans rotation,
+    `checkpoints/` gonfle sans fin. `latest.pt` / `ref_strength.pt` ne matchent pas
+    le motif -> jamais supprimés. keep <= 0 = tout garder (comportement historique).
+    """
+    if not keep or keep <= 0:
+        return
+    snaps = []
+    for p in ckpt_dir.glob("step_*.pt"):
+        try:
+            snaps.append((int(p.stem.split("_")[1]), p))
+        except (IndexError, ValueError):
+            continue
+    snaps.sort()
+    for _, p in snaps[:-keep]:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
 def _save(path: Path, model, cfg, opt, step, ema: EMA | None) -> None:
-    """Sauvegarde atomique. Avec EMA : model_state=EMA (jeu), raw_state pour reprise."""
+    """Sauvegarde atomique. Avec EMA : model_state=EMA (jeu), raw_state pour reprise.
+
+    On dé-wrappe un éventuel modèle `torch.compile` : sinon les clés `_orig_mod.`
+    rendraient le checkpoint illisible par le moteur/online au hot-reload.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    model = unwrap_model(model)
     if ema is not None:
         payload = {
             "model_state": ema.state_dict(model),
@@ -96,15 +124,37 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
 
     pin = device == "cuda"
     nworkers = tcfg.get("num_workers", 4)
+    # prefetch_factor n'est valide qu'avec des workers (>0) ; sinon il faut None.
+    extra_loader = ({"prefetch_factor": tcfg.get("prefetch_factor", 2)}
+                    if nworkers > 0 else {})
     loader = DataLoader(ds, batch_size=tcfg["batch_size"], shuffle=True,
                         num_workers=nworkers, pin_memory=pin, drop_last=True,
-                        persistent_workers=nworkers > 0)
+                        persistent_workers=nworkers > 0, **extra_loader)
 
     model = build_model(cfg).to(device)
+    if device == "cuda":
+        # channels_last : conv 2D plus rapides sur tensor cores (Ampere/Ada/Hopper).
+        model = model.to(memory_format=torch.channels_last)
+    # torch.compile (formes fixes 8x8 -> gros gain sur gros GPU). On le garde
+    # OPTIONNEL et tolérant : si la compilation échoue (vieux GPU, build sans
+    # Triton…), on retombe sur le modèle eager. Le save dé-wrappe le `_orig_mod.`.
+    if tcfg.get("compile", False) and device == "cuda":
+        try:
+            model = torch.compile(model, mode="max-autotune")
+            print("torch.compile activé (max-autotune).")
+        except Exception as e:
+            print(f"torch.compile ignoré : {e}")
     opt = torch.optim.AdamW(model.parameters(), lr=tcfg["lr"],
                             weight_decay=tcfg["weight_decay"])
     use_amp = amp_enabled(device, tcfg.get("amp", True))
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    amp_dtype = resolve_amp_dtype(device, tcfg.get("amp_dtype")) if use_amp else None
+    # GradScaler UNIQUEMENT en fp16 : bf16 a la plage dynamique d'un float32, donc
+    # pas d'underflow de gradient à compenser -> pas de scaler (cf. doc PyTorch).
+    use_scaler = use_amp and amp_dtype == torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    if use_amp:
+        print(f"AMP : {('bf16' if amp_dtype == torch.bfloat16 else 'fp16')}"
+              f" (GradScaler {'actif' if use_scaler else 'désactivé'}).")
     vlw = tcfg.get("value_loss_weight", 1.0)
     grad_clip = tcfg.get("grad_clip", 1.0)
     label_smooth = tcfg.get("label_smoothing", 0.0)
@@ -117,11 +167,15 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
     max_steps = tcfg["pretrain_steps"]
     log_every = tcfg["log_every"]
     ckpt_every = tcfg["checkpoint_every"]
+    keep_last_ckpt = tcfg.get("keep_last_checkpoints", 0)
 
     step = 0
     if resume and latest.exists():
         ckpt = load_checkpoint(latest, map_location=device)
-        info = load_model_state(model, ckpt.get("raw_state", ckpt["model_state"]))
+        # unwrap : si le modèle est compilé, ses clés portent `_orig_mod.` et les
+        # poids (clés propres) ne se chargeraient PAS -> on charge dans le module nu.
+        info = load_model_state(unwrap_model(model),
+                                ckpt.get("raw_state", ckpt["model_state"]))
         # Ne réutiliser l'optimiseur QUE si l'architecture est identique. Sinon
         # (warm-start après changement de tête, ex. scalar -> wdl) ses moments ont
         # des formes incompatibles et plantent au 1ᵉʳ step -> on repart à neuf.
@@ -141,7 +195,9 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
         print(f"Reprise depuis {latest} au step {step}/{max_steps}.")
 
     ema_decay = tcfg.get("ema_decay", 0.0)
-    ema = EMA(model, ema_decay) if ema_decay and ema_decay > 0 else None
+    # EMA toujours pilotée par le module NU (clés sans `_orig_mod.`) : sinon, sous
+    # torch.compile, `k in shadow` serait toujours faux et l'EMA ne bougerait jamais.
+    ema = EMA(unwrap_model(model), ema_decay) if ema_decay and ema_decay > 0 else None
     if ema is not None:
         print(f"EMA des poids activée (decay={ema_decay}).")
 
@@ -151,6 +207,8 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
     while step < max_steps:
         for planes, target_policy, target_val in loader:
             planes = planes.to(device, non_blocking=True)
+            if device == "cuda":
+                planes = planes.contiguous(memory_format=torch.channels_last)
             target_policy = target_policy.to(device, non_blocking=True)
             target_val = target_val.to(device, non_blocking=True)
 
@@ -159,7 +217,7 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
                 g["lr"] = lr
 
             opt.zero_grad(set_to_none=True)
-            with autocast_ctx(device, use_amp):
+            with autocast_ctx(device, use_amp, amp_dtype):
                 logits, value = model(planes)
                 loss_p = policy_loss(logits, target_policy, label_smooth)
                 loss_v = value_loss(value, target_val)
@@ -172,7 +230,7 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
             scaler.step(opt)
             scaler.update()
             if ema is not None:
-                ema.update(model)
+                ema.update(unwrap_model(model))
 
             running_p += loss_p.item()
             running_v += loss_v.item()
@@ -189,6 +247,7 @@ def train(cfg: dict, shards_dir: str | None, resume: bool = True):
             if step % ckpt_every == 0:
                 _save(ckpt_dir / f"step_{step}.pt", model, cfg, opt, step, ema)
                 _save(latest, model, cfg, opt, step, ema)
+                _prune_checkpoints(ckpt_dir, keep_last_ckpt)
                 print(f"  checkpoint -> {latest}")
 
             if step >= max_steps:

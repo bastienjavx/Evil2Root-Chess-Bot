@@ -43,10 +43,11 @@ from torch.utils.data.distributed import DistributedSampler
 
 from ..model import build_model
 from ..utils import (amp_enabled, autocast_ctx, load_checkpoint, load_config,
-                     load_model_state, resolve_device, save_checkpoint)
+                     load_model_state, resolve_amp_dtype, resolve_device,
+                     save_checkpoint)
 from .dataset import ShardDataset, find_shards
 from .losses import policy_loss, value_loss
-from .pretrain import EMA, lr_at_step
+from .pretrain import EMA, _prune_checkpoints, lr_at_step
 
 
 # --- Initialisation du groupe de processus ------------------------------------
@@ -160,7 +161,10 @@ def run(cfg: dict, shards_dir: str | None, args, resume: bool = True):
     opt = torch.optim.AdamW(model.parameters(), lr=tcfg["lr"],
                             weight_decay=tcfg["weight_decay"])
     use_amp = amp_enabled(device, tcfg.get("amp", True))
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    amp_dtype = resolve_amp_dtype(device, tcfg.get("amp_dtype")) if use_amp else None
+    # GradScaler seulement en fp16 (bf16 = plage dynamique fp32, pas de scaler).
+    use_scaler = use_amp and amp_dtype == torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
     vlw = tcfg.get("value_loss_weight", 1.0)
     grad_clip = tcfg.get("grad_clip", 1.0)
     label_smooth = tcfg.get("label_smoothing", 0.0)
@@ -204,7 +208,7 @@ def run(cfg: dict, shards_dir: str | None, args, resume: bool = True):
                 g["lr"] = lr
 
             opt.zero_grad(set_to_none=True)
-            with autocast_ctx(device, use_amp):
+            with autocast_ctx(device, use_amp, amp_dtype):
                 logits, value = model(planes)
                 loss_p = policy_loss(logits, target_policy, label_smooth)
                 loss_v = value_loss(value, target_val)
@@ -236,6 +240,7 @@ def run(cfg: dict, shards_dir: str | None, args, resume: bool = True):
             if is_main and step % ckpt_every == 0:
                 _save_dist(ckpt_dir / f"step_{step}.pt", model, cfg, opt, step, ema)
                 _save_dist(latest, model, cfg, opt, step, ema)
+                _prune_checkpoints(ckpt_dir, tcfg.get("keep_last_checkpoints", 0))
                 log(f"  checkpoint -> {latest}")
 
             if step >= max_steps:
