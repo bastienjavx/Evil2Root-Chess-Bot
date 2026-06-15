@@ -6,11 +6,12 @@ des bénévoles génèrent des parties de self-play, une machine GPU centralise
 l'entraînement, et le modèle amélioré redescend vers tout le monde.
 
 ```
-        Railway (coordinateur, CPU)              Ta machine GPU (trainer)
-   ┌──────────────────────────────┐         ┌──────────────────────────────┐
-   │ distribue les jobs           │ ◄────── │ publie le modèle (publish)   │
-   │ collecte/valide les parties  │ ──────► │ entraîne (online.py, GPU)    │
-   │ sert le modèle + dashboard   │         └──────────────────────────────┘
+        Railway (coordinateur, CPU)          1+ machine(s) GPU (trainer·s)
+   ┌──────────────────────────────┐      ┌──────────────────────────────────┐
+   │ distribue les jobs           │ ◄─── │ contribue/publie les poids        │
+   │ collecte/valide les parties  │ ───► │ entraîne (online.py ou FedAvg)    │
+   │ sert le modèle + dashboard   │      │ §2 : 1 trainer · §2bis : N (FedAvg)│
+   │ arbitre les rounds FedAvg    │      └──────────────────────────────────┘
    └──────────────────────────────┘
         ▲ download modèle   ▲ upload parties
    ┌────┴────┐  ┌───────────┴────┐  ┌──────────────┐
@@ -71,6 +72,55 @@ TRAINER_TOKEN=le-meme-secret-que-railway \
   `latest.pt` se met à jour → republié automatiquement (version incrémentée).
 - `--no-train` : ne fait que synchroniser + publier (si tu lances `online.py` toi-même).
 - `--seed-shards data/shards` : amorce `online.py` avec des données existantes.
+
+---
+
+## 2 bis. Plusieurs trainers (federated averaging)
+
+Pour augmenter le **débit d'entraînement**, tu peux faire tourner **plusieurs machines
+GPU de train principal**, réparties sur Internet, partageant le **même `TRAINER_TOKEN`**.
+Elles entraînent toutes le *même* modèle en parallèle (data-parallel asynchrone, façon
+FedAvg) et leurs poids sont **moyennés** périodiquement : une **lignée unique** est
+préservée, sans qu'aucune machine n'écrase le travail d'une autre.
+
+> Le mode mono-trainer du §2 reste inchangé. Et comme `train/distributed.py` (all-reduce
+> gloo) suppose un **LAN fiable**, c'est ce mode FedAvg qui convient à des machines
+> distantes.
+
+Sur **chaque** machine de train (même token) :
+
+```bash
+TRAINER_TOKEN=le-meme-secret-que-railway \
+  python -m sanchess.cluster.trainer --server https://<app>.up.railway.app \
+    --fedavg --trainer-id <nom-unique> --local-steps 400
+```
+
+Comment ça marche (un **round** = base `v` → version `v+1`) :
+
+1. chaque trainer télécharge le modèle global `v` (écrit aussi dans `latest.pt` local) ;
+2. il entraîne `--local-steps` pas sur les parties synchronisées ;
+3. il envoie ses poids (`/cluster/trainer/contribute`, blob opaque + `num_samples`) ;
+4. à la fermeture du round (quorum ou deadline), **un seul** trainer (le *finalizer* =
+   premier contributeur) télécharge toutes les contributions, les **moyenne** (pondérées
+   par `num_samples`) et publie → `v+1`, round suivant ; les autres re-téléchargent.
+
+Robustesse : la publication est **idempotente par round** (un seul publish accepté), donc
+même si deux trainers finalisent en même temps, un seul gagne. Si le finalizer meurt, un
+autre reprend après le délai de grâce. **Le coordinateur reste sans torch** : il ne fait
+qu'arbitrer le cycle des rounds et router les blobs — la moyenne se fait côté trainers.
+
+Options utiles : `--local-steps N` (pas par round, défaut 400 ; rester modéré pour éviter
+la divergence FedAvg), `--trainer-id NOM` (identité stable, défaut = nom d'hôte),
+`--fed-batch-size N`, `--seed-shards data/shards` (amorçage). Mêmes réglages en env :
+`SANO1_FEDAVG=1`, `SANO1_FED_LOCAL_STEPS`, `SANO1_TRAINER_ID`.
+
+Variables d'environnement **côté coordinateur** (Railway) pour régler le rythme :
+
+| Variable | Rôle | Défaut |
+|---|---|---|
+| `FED_ROUND_TIMEOUT` | s avant de fermer un round même incomplet | `180` |
+| `FED_QUORUM` | contributions min pour fermer tôt (1 = mono-trainer OK) | `1` |
+| `FED_FINALIZE_GRACE` | s après deadline avant qu'un autre trainer reprenne la finalisation | `60` |
 
 ---
 

@@ -50,6 +50,13 @@ VALIDATE_SAMPLE = int(os.environ.get("POOL_VALIDATE_SAMPLE", P.DEFAULT_VALIDATE_
 UPLOADS_PER_MIN = int(os.environ.get("POOL_UPLOADS_PER_MIN", P.DEFAULT_UPLOADS_PER_MIN))
 ACTIVE_WINDOW_SEC = int(os.environ.get("POOL_ACTIVE_WINDOW_SEC", 300))
 
+# Federated averaging (plusieurs trainers ; cf. CLUSTER.md). Tailles de blob de poids
+# bien plus grandes que des shards -> garde-fou dédié.
+FED_ROUND_TIMEOUT = float(os.environ.get("FED_ROUND_TIMEOUT", P.DEFAULT_FED_ROUND_TIMEOUT))
+FED_QUORUM = int(os.environ.get("FED_QUORUM", P.DEFAULT_FED_QUORUM))
+FED_FINALIZE_GRACE = float(os.environ.get("FED_FINALIZE_GRACE", P.DEFAULT_FED_FINALIZE_GRACE))
+MAX_WEIGHTS_BYTES = int(os.environ.get("FED_MAX_WEIGHTS_BYTES", 512 * 1024 * 1024))
+
 # Paramètres du job distribué (réglables sans toucher au code, via env Railway).
 JOB_DEFAULTS = P.JobSpec(
     nodes=int(os.environ.get("JOB_NODES", 160)),
@@ -66,6 +73,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 MODEL_PATH = POOL_DIR / P.MODEL_FILENAME
 MODEL_META_PATH = POOL_DIR / P.MODEL_META_FILENAME
 INCOMING_DIR = POOL_DIR / P.INCOMING_DIRNAME
+ROUNDS_DIR = POOL_DIR / P.ROUNDS_DIRNAME
+ROUND_META_PATH = POOL_DIR / P.ROUND_META_FILENAME
 DB_PATH = POOL_DIR / P.DB_FILENAME
 
 
@@ -104,6 +113,11 @@ def _connect() -> sqlite3.Connection:
 def _init_storage() -> None:
     POOL_DIR.mkdir(parents=True, exist_ok=True)
     INCOMING_DIR.mkdir(parents=True, exist_ok=True)
+    ROUNDS_DIR.mkdir(parents=True, exist_ok=True)
+    if not ROUND_META_PATH.exists():
+        _write_round({"round": 1, "base_version": _read_model_info().version,
+                      "started_at": time.time(), "finalizer_id": "",
+                      "prev_contributors": []})
     with _db_lock, _connect() as conn:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS contributors ("
@@ -140,6 +154,62 @@ def _write_model_info(info: P.ModelInfo) -> None:
     tmp = MODEL_META_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(info.to_dict()))
     os.replace(tmp, MODEL_META_PATH)
+
+
+# --- Federated averaging : cycle des rounds ----------------------------------
+# round.json persiste l'état DURABLE du round (numéro, base_version, finalizer désigné,
+# contributeurs du round précédent -> sert à dimensionner le quorum « expected »). Les
+# contributions, elles, vivent dans rounds/<R>/ et sont comptées à la volée.
+
+def _read_round() -> dict:
+    if ROUND_META_PATH.exists():
+        try:
+            return json.loads(ROUND_META_PATH.read_text())
+        except (OSError, ValueError):
+            pass
+    return {"round": 1, "base_version": _read_model_info().version,
+            "started_at": time.time(), "finalizer_id": "", "prev_contributors": []}
+
+
+def _write_round(data: dict) -> None:
+    tmp = ROUND_META_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data))
+    os.replace(tmp, ROUND_META_PATH)
+
+
+def _round_contributors(round_no: int) -> list[str]:
+    """ids des trainers ayant contribué au round (un .pt = une contribution)."""
+    rdir = ROUNDS_DIR / str(round_no)
+    if not rdir.exists():
+        return []
+    return sorted(p.stem for p in rdir.glob("*.pt"))
+
+
+def _gc_round_dir(round_no: int) -> None:
+    """Supprime le dossier d'un round finalisé (les blobs de poids sont volumineux)."""
+    import shutil
+    try:
+        shutil.rmtree(ROUNDS_DIR / str(round_no))
+    except OSError:
+        pass
+
+
+def _round_state(now: float) -> P.RoundInfo:
+    """Instantané live du round courant : combine round.json (durable) + comptage des
+    contributions sur disque. Ferme par quorum OU deadline ; `can_finalize` ouvre la
+    finalisation aux autres trainers après le délai de grâce (reprise si finalizer mort)."""
+    rec = _read_round()
+    contributors = _round_contributors(rec["round"])
+    n = len(contributors)
+    expected = max(FED_QUORUM, len(rec.get("prev_contributors") or []))
+    deadline = rec["started_at"] + FED_ROUND_TIMEOUT
+    closed = n >= 1 and (n >= expected or now >= deadline)
+    can_finalize = closed and (n >= expected or now >= deadline + FED_FINALIZE_GRACE)
+    return P.RoundInfo(
+        round=rec["round"], base_version=rec["base_version"],
+        started_at=rec["started_at"], deadline=deadline, expected=expected,
+        finalizer_id=rec.get("finalizer_id", ""), num_contributions=n,
+        contributors=contributors, closed=closed, can_finalize=can_finalize)
 
 
 # --- Validation des shards uploadés ------------------------------------------
@@ -351,6 +421,7 @@ def shards(since: str = "", download: str = ""):
 async def model_publish(request: Request,
                         model: UploadFile = File(...),
                         step: int = Form(0),
+                        round: int = Form(-1),
                         authorization: str = Header("")):
     token = authorization.replace("Bearer", "").strip()
     if not TRAINER_TOKEN or token != TRAINER_TOKEN:
@@ -358,15 +429,114 @@ async def model_publish(request: Request,
     raw = await model.read()
     if not raw:
         return JSONResponse({"error": "fichier vide"}, status_code=400)
+    if len(raw) > MAX_WEIGHTS_BYTES:
+        return JSONResponse({"error": "modèle trop volumineux"}, status_code=413)
     sha = hashlib.sha256(raw).hexdigest()
-    tmp = MODEL_PATH.with_suffix(".pt.tmp")
-    tmp.write_bytes(raw)
-    os.replace(tmp, MODEL_PATH)
-    prev = _read_model_info()
-    info = P.ModelInfo(version=prev.version + 1, step=int(step), sha256=sha,
-                       size=len(raw), has_model=True, published_at=time.time())
-    _write_model_info(info)
+    # Section critique sous _db_lock : la garde idempotente par round ET l'incrément de
+    # version doivent être atomiques, sinon deux finalizers FedAvg incrémenteraient la
+    # version deux fois pour le même round. `round=-1` = publish mono-trainer historique
+    # (aucune garde, comportement strictement inchangé).
+    with _db_lock:
+        if round >= 0:
+            cur = _read_round()
+            if round != cur["round"]:
+                return JSONResponse(
+                    {"error": "round déjà finalisé", "round": cur["round"],
+                     "version": _read_model_info().version}, status_code=409)
+        tmp = MODEL_PATH.with_suffix(".pt.tmp")
+        tmp.write_bytes(raw)
+        os.replace(tmp, MODEL_PATH)
+        prev = _read_model_info()
+        info = P.ModelInfo(version=prev.version + 1, step=int(step), sha256=sha,
+                           size=len(raw), has_model=True, published_at=time.time())
+        _write_model_info(info)
+        if round >= 0:
+            # Avance au round suivant : base = version publiée ; on garde les
+            # contributeurs de ce round pour dimensionner le quorum du suivant ; purge.
+            done = _round_contributors(round)
+            _write_round({"round": round + 1, "base_version": info.version,
+                          "started_at": time.time(), "finalizer_id": "",
+                          "prev_contributors": done})
+            _gc_round_dir(round)
+        else:
+            # Publish mono-trainer / amorçage (round=-1) : on n'avance PAS le round,
+            # mais on aligne sa base_version sur le modèle servi pour que les
+            # contributions FedAvg ultérieures (base_version == version courante) passent.
+            cur = _read_round()
+            if cur.get("base_version") != info.version:
+                cur["base_version"] = info.version
+                _write_round(cur)
     return info.to_dict()
+
+
+@app.get(P.EP_ROUND)
+def round_state():
+    return _round_state(time.time()).to_dict()
+
+
+@app.post(P.EP_CONTRIBUTE)
+async def contribute(weights: UploadFile = File(...),
+                     trainer_id: str = Form(...),
+                     base_version: int = Form(0),
+                     num_samples: int = Form(0),
+                     step: int = Form(0),
+                     authorization: str = Header("")):
+    token = authorization.replace("Bearer", "").strip()
+    if not TRAINER_TOKEN or token != TRAINER_TOKEN:
+        return JSONResponse({"error": "trainer token invalide"}, status_code=401)
+    raw = await weights.read()
+    if not raw:
+        return JSONResponse({"error": "fichier vide"}, status_code=400)
+    if len(raw) > MAX_WEIGHTS_BYTES:
+        return JSONResponse({"error": "modèle trop volumineux"}, status_code=413)
+    tid = "".join(c for c in trainer_id if c.isalnum() or c in "-_")[:48] or "anon"
+    sha = hashlib.sha256(raw).hexdigest()
+    with _db_lock:
+        cur = _read_round()
+        if base_version != cur["base_version"]:
+            # Le trainer a entraîné sur une version périmée -> sa contribution
+            # mélangerait deux lignées. On le renvoie resynchroniser le modèle global.
+            return JSONResponse(
+                {"error": "base_version périmée : resynchronise le modèle global",
+                 "round": cur["round"], "base_version": cur["base_version"]},
+                status_code=409)
+        rdir = ROUNDS_DIR / str(cur["round"])
+        rdir.mkdir(parents=True, exist_ok=True)
+        tmp = rdir / f".{tid}.pt.partial"
+        tmp.write_bytes(raw)
+        os.replace(tmp, rdir / f"{tid}.pt")
+        (rdir / f"{tid}.json").write_text(json.dumps(
+            {"trainer_id": tid, "num_samples": int(num_samples), "step": int(step),
+             "sha256": sha, "at": time.time()}))
+        if not cur.get("finalizer_id"):     # 1er contributeur = finalizer désigné
+            cur["finalizer_id"] = tid
+            _write_round(cur)
+        state = _round_state(time.time())
+    return {"round": state.round, "is_finalizer": state.finalizer_id == tid,
+            "finalizer_id": state.finalizer_id,
+            "num_contributions": state.num_contributions,
+            "expected": state.expected, "closed": state.closed}
+
+
+@app.get(P.EP_CONTRIBUTIONS)
+def contributions(round: int = -1, download: str = ""):
+    """Finalizer : liste les contributions du round (avec num_samples pour la moyenne
+    pondérée), ou en télécharge une (`download=<trainer_id>`)."""
+    r = _read_round()["round"] if round < 0 else round
+    rdir = ROUNDS_DIR / str(r)
+    if download:
+        target = rdir / f"{Path(download).name}.pt"
+        if not target.exists():
+            return JSONResponse({"error": "contribution introuvable"}, status_code=404)
+        return FileResponse(target, media_type="application/octet-stream",
+                            filename=target.name)
+    items = []
+    for meta in sorted(rdir.glob("*.json")):
+        try:
+            items.append(json.loads(meta.read_text()))
+        except (OSError, ValueError):
+            continue
+    return {"round": r, "contributions": items}
 
 
 def _snapshot_stats() -> P.Stats:
@@ -391,8 +561,10 @@ def _snapshot_stats() -> P.Stats:
     hour_ago = (int(now // 60) * 60) - 3600
     games_hr = sum(b[1] for b in _minute_buckets if b[0] >= hour_ago)
     samples_hr = sum(b[2] for b in _minute_buckets if b[0] >= hour_ago)
+    rstate = _round_state(now)
     return P.Stats(
         model_version=info.version, model_step=info.step, has_model=info.has_model,
+        model_round=rstate.round, active_trainers=rstate.num_contributions,
         model_published_at=info.published_at,
         total_games=agg[0], total_samples=agg[1], total_contributors=agg[2],
         active_workers=active, games_per_min=float(len(_games_log)),
