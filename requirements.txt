@@ -7,7 +7,7 @@ numpy>=1.26
 python-chess>=1.999
 
 # Données Lichess
-zstandard>=0.22      # décompression des dumps .pgn.zst
+zstandard>=0.25.0      # décompression des dumps .pgn.zst
 requests>=2.31       # API Lichess (stream temps réel)
 
 # Config / utilitaires
