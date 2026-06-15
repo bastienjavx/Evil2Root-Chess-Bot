@@ -8,7 +8,7 @@ python-chess>=1.999
 
 # Données Lichess
 zstandard>=0.22      # décompression des dumps .pgn.zst
-requests>=2.31       # API Lichess (stream temps réel)
+requests>=2.34.2       # API Lichess (stream temps réel)
 
 # Config / utilitaires
 pyyaml>=6.0.3
