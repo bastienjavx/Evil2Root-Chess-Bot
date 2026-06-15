@@ -63,10 +63,18 @@ def _parse_positive_int_or_auto(value, *, name: str) -> int | None:
     return n
 
 
-def _resolve_workers(value, reserve_cores: int, cpu_count: int | None = None) -> int:
+def _resolve_workers(value, reserve_cores: int, cpu_count: int | None = None,
+                     *, cuda: bool = False) -> int:
     explicit = _parse_positive_int_or_auto(value, name="workers")
     if explicit is not None:
         return explicit
+    if cuda:
+        # Sur GPU, un seul process suffit : BatchedSelfPlay batche déjà TOUTES les
+        # parties en une seule éval NN. Lancer cpu_count process CPU-bound
+        # affamerait le GPU (chacun ne batchant qu'1/N des parties, micro-batches)
+        # et dupliquerait le modèle en VRAM jusqu'à l'OOM. On veut 1 process qui
+        # sature le GPU via --gpu-games. Override possible avec --workers N.
+        return 1
     ncpu = int(cpu_count or os.cpu_count() or 1)
     reserve = max(0, int(reserve_cores))
     return max(1, ncpu - reserve)
@@ -324,8 +332,11 @@ def main() -> None:
     args = ap.parse_args()
 
     args.power_profile = "auto-agressif"
+    # Le matériel décide le dimensionnement auto : sur CUDA, --workers auto = 1
+    # process qui batche tout sur le GPU (sinon le GPU est affamé, cf. _resolve_workers).
+    is_cuda = device_kind(resolve_device(args.device)) == "cuda"
     try:
-        args.workers = _resolve_workers(args.workers, args.reserve_cores)
+        args.workers = _resolve_workers(args.workers, args.reserve_cores, cuda=is_cuda)
         args.threads = _resolve_threads(args.threads)
         args.gpu_games_total = _resolve_optional_positive(args.gpu_games,
                                                           name="gpu-games")
