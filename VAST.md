@@ -39,9 +39,18 @@ et lance le worker en tâche de fond.
 |---|:---:|---|---|
 | `SANO1_SERVER` | | URL du coordinateur (défaut: coordinateur officiel) | `https://evil2root-chess-bot-production.up.railway.app` |
 | `SANO1_WORKER_NAME` | | Pseudo au leaderboard | `bastien-vast-3090` |
-| `SANO1_WORKER_GPU_GAMES` | | Budget parties GPU batchées | `512` |
-| `SANO1_WORKER_WORKERS` | | Process self-play parallèles | `auto` |
+| `SANO1_WORKER_GPU_GAMES` | | Budget parties GPU batchées (total, réparti entre process) | `512` |
+| `SANO1_WORKER_WORKERS` | | Process self-play parallèles (`auto` recommandé) | `auto` |
+| `SANO1_WORKER_VRAM_PER_PROC_GB` | | VRAM estimée par process pour l'auto-sizing | `2.5` |
 | `SANO1_BRANCH` | | Branche git à utiliser | `main` |
+
+**Auto-sizing GPU (`SANO1_WORKER_WORKERS=auto`, défaut).** Le MCTS est CPU-bound,
+donc un seul process laisse le GPU quasi inactif. En `auto`, le worker **détecte
+tous les GPU** et lance autant de process que la **VRAM libre** le permet
+(≈ `SANO1_WORKER_VRAM_PER_PROC_GB` par process), borné par les cœurs CPU, et les
+**répartit sur tous les GPU**. Ex. un GPU 12 Go → ~4 process ; deux GPU 12 Go →
+jusqu'à ~8, étalés. Baisse `SANO1_WORKER_VRAM_PER_PROC_GB` pour en lancer plus,
+ou fixe un nombre explicite avec `SANO1_WORKER_WORKERS=N`.
 
 Toutes les options de `worker.py` sont pilotables par `SANO1_WORKER_*`
 (`DEVICE`, `THREADS`, `RESERVE_CORES`, `GPU_LEAVES`, `NICE`) — cf. CLUSTER.md §3.

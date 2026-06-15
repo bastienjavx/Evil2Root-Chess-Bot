@@ -63,21 +63,75 @@ def _parse_positive_int_or_auto(value, *, name: str) -> int | None:
     return n
 
 
-def _resolve_workers(value, reserve_cores: int, cpu_count: int | None = None,
-                     *, cuda: bool = False) -> int:
+def _resolve_workers(value, reserve_cores: int, cpu_count: int | None = None) -> int:
     explicit = _parse_positive_int_or_auto(value, name="workers")
     if explicit is not None:
         return explicit
-    if cuda:
-        # Sur GPU, un seul process suffit : BatchedSelfPlay batche déjà TOUTES les
-        # parties en une seule éval NN. Lancer cpu_count process CPU-bound
-        # affamerait le GPU (chacun ne batchant qu'1/N des parties, micro-batches)
-        # et dupliquerait le modèle en VRAM jusqu'à l'OOM. On veut 1 process qui
-        # sature le GPU via --gpu-games. Override possible avec --workers N.
-        return 1
     ncpu = int(cpu_count or os.cpu_count() or 1)
     reserve = max(0, int(reserve_cores))
     return max(1, ncpu - reserve)
+
+
+# VRAM estimée par process de self-play GPU (modèle + activations batchées). Le
+# MCTS Python étant CPU-bound, on lance PLUSIEURS process pour alimenter le GPU
+# en continu ; chacun tient sa propre copie du modèle d'où ce budget. Réglable
+# via SANO1_WORKER_VRAM_PER_PROC_GB (baisse-le si tu veux plus de process).
+_VRAM_PER_PROC_GB = float(os.environ.get("SANO1_WORKER_VRAM_PER_PROC_GB", "2.5"))
+
+
+def _cuda_free_gb() -> list[float]:
+    """VRAM libre (Go) de chaque GPU CUDA visible (index 0..n-1)."""
+    import torch
+    free = []
+    for i in range(torch.cuda.device_count()):
+        try:
+            f, _ = torch.cuda.mem_get_info(i)
+        except Exception:
+            f = 0
+        free.append(f / (1024 ** 3))
+    return free
+
+
+def _plan_cuda_devices(value, reserve_cores: int, *,
+                       per_proc_gb: float = _VRAM_PER_PROC_GB,
+                       cpu_count: int | None = None,
+                       free_gb: list[float] | None = None) -> list[str]:
+    """Planifie le device CUDA de chaque process worker (un par process).
+
+    'auto' : remplit chaque GPU selon sa VRAM LIBRE (~per_proc_gb par process),
+    le total étant borné par les cœurs CPU dispo (le MCTS Python est CPU-bound,
+    inutile d'avoir plus de process que de cœurs). Un entier explicite
+    (--workers N) est réparti en round-robin sur les GPU sans dépasser la
+    capacité VRAM de chacun. Détecte et exploite PLUSIEURS GPU automatiquement.
+    Retourne p.ex. ['cuda:0','cuda:0','cuda:1'] (ordre = round-robin)."""
+    import torch
+    ngpu = max(1, torch.cuda.device_count())
+    free_gb = free_gb if free_gb is not None else (_cuda_free_gb() or [0.0] * ngpu)
+    ncpu = int(cpu_count or os.cpu_count() or 1)
+    cap_cpu = max(1, ncpu - max(0, int(reserve_cores)))
+    # Process que chaque GPU peut héberger (au moins 1 par GPU présent).
+    cap_vram = [max(1, int(g * 0.9 / max(0.5, per_proc_gb))) for g in free_gb]
+
+    explicit = _parse_positive_int_or_auto(value, name="workers")
+    total = explicit if explicit is not None else min(cap_cpu, sum(cap_vram))
+    total = max(1, total)
+
+    devices: list[str] = []
+    counts = [0] * ngpu
+    idx = 0
+    while len(devices) < total:
+        placed = False
+        for _ in range(ngpu):                  # round-robin sur les GPU
+            g = idx % ngpu
+            idx += 1
+            if counts[g] < cap_vram[g]:
+                devices.append(f"cuda:{g}")
+                counts[g] += 1
+                placed = True
+                break
+        if not placed:
+            break                              # toutes les GPU pleines (VRAM)
+    return devices or ["cuda:0"]
 
 
 def _resolve_threads(value) -> int:
@@ -240,12 +294,14 @@ def _upload(server: str, rows: list[tuple], worker_id: str, name: str) -> P.Uplo
 
 # --- Boucle worker ------------------------------------------------------------
 
-def run_loop(args, wid: str) -> None:
+def run_loop(args, wid: str, device_override: str | None = None) -> None:
     import torch
     cfg = load_config(args.config) if args.config else load_config()
-    device = resolve_device(args.device)
+    device = device_override or resolve_device(args.device)
     kind = device_kind(device)
     torch.set_num_threads(max(1, int(args.threads)))
+    if kind == "cuda" and ":" in device:
+        torch.cuda.set_device(device)          # épingle CE process sur SON GPU
     if kind in ("cpu", "mps"):
         try:
             os.nice(int(args.nice))                # priorité basse : ne fige pas le poste
@@ -332,11 +388,18 @@ def main() -> None:
     args = ap.parse_args()
 
     args.power_profile = "auto-agressif"
-    # Le matériel décide le dimensionnement auto : sur CUDA, --workers auto = 1
-    # process qui batche tout sur le GPU (sinon le GPU est affamé, cf. _resolve_workers).
+    # Le matériel décide le dimensionnement auto. Sur CUDA : on planifie un device
+    # par process en remplissant chaque GPU selon sa VRAM libre (multi-GPU géré),
+    # car le MCTS Python est CPU-bound -> plusieurs process alimentent le GPU.
+    # Sur CPU/MPS : presque tous les cœurs. Un --workers N explicite est respecté.
     is_cuda = device_kind(resolve_device(args.device)) == "cuda"
+    worker_devices: list[str] | None = None
     try:
-        args.workers = _resolve_workers(args.workers, args.reserve_cores, cuda=is_cuda)
+        if is_cuda:
+            worker_devices = _plan_cuda_devices(args.workers, args.reserve_cores)
+            args.workers = len(worker_devices)
+        else:
+            args.workers = _resolve_workers(args.workers, args.reserve_cores)
         args.threads = _resolve_threads(args.threads)
         args.gpu_games_total = _resolve_optional_positive(args.gpu_games,
                                                           name="gpu-games")
@@ -346,21 +409,30 @@ def main() -> None:
         ap.error(str(exc))
     _configure_thread_env()
 
+    gpu_plan = ""
+    if worker_devices:
+        from collections import Counter
+        c = Counter(worker_devices)
+        gpu_plan = " | gpus=" + ", ".join(f"{d}×{n}" for d, n in sorted(c.items()))
     print("[worker] configuration locale : "
           f"workers={args.workers} threads={args.threads} "
           f"reserve_cores={args.reserve_cores} "
           f"gpu_games={args.gpu_games_total or 'serveur'} "
-          f"gpu_leaves={args.gpu_leaves_per_game or 'serveur'}",
+          f"gpu_leaves={args.gpu_leaves_per_game or 'serveur'}{gpu_plan}",
           flush=True)
 
     if args.workers <= 1:
-        run_loop(args, uuid.uuid4().hex)
+        run_loop(args, uuid.uuid4().hex,
+                 device_override=(worker_devices[0] if worker_devices else None))
         return
 
     import torch.multiprocessing as mp
     ctx = mp.get_context("spawn")
-    procs = [ctx.Process(target=run_loop, args=(args, uuid.uuid4().hex), daemon=False)
-             for _ in range(args.workers)]
+    procs = [ctx.Process(target=run_loop, args=(args, uuid.uuid4().hex),
+                         kwargs={"device_override":
+                                 (worker_devices[k] if worker_devices else None)},
+                         daemon=False)
+             for k in range(args.workers)]
     for p in procs:
         p.start()
     try:
