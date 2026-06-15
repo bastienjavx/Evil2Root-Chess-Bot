@@ -1,7 +1,7 @@
 # Coeur ML — installe PyTorch avec CUDA séparément si besoin :
 #   pip install torch --index-url https://download.pytorch.org/whl/cu121
 torch>=2.2
-numpy>=1.26
+numpy>=2.4.6
 
 # Échecs
 python-chess>=1.999
