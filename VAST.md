@@ -63,8 +63,17 @@ tail -f /workspace/sano1_worker.log     # logs du worker
 nvidia-smi                              # le GPU doit être utilisé
 ```
 
-- **Le worker ne démarre pas** → `SANO1_SERVER` manquant ou mal orthographié
-  (l'on-start sort en erreur, visible dans les logs Vast de l'instance).
+- **« tout tourne sur le CPU » / GPU inactif** → torch ne voit pas le GPU
+  (`torch.cuda.is_available()` = False) et `--device auto` retombe en silence sur
+  CPU. L'on-start fait désormais un **préflight CUDA** : il affiche `nvidia-smi` +
+  la version torch/CUDA et **refuse de lancer** sur CPU (gaspillage sur GPU
+  payant). Corrige l'**image Docker** : prends-en une avec torch+CUDA, p.ex.
+  `pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime`, et vérifie que le driver de
+  l'hôte est compatible avec la version CUDA de l'image. Pour forcer le CPU malgré
+  tout : `SANO1_ALLOW_CPU=1`.
+- **Le worker ne démarre pas** → `SANO1_SERVER` manquant/mal orthographié, ou
+  préflight CUDA en échec (voir ci-dessus) ; l'on-start sort en erreur, visible
+  dans les logs Vast de l'instance et dans `/workspace/sano1_worker.log`.
 - **0 partie créditée** → vérifie que l'URL du coordinateur est joignable
   (`curl $SANO1_SERVER/cluster/stats`).
 - **Redémarrage d'instance** → l'on-start fait un `git reset --hard` sur le
