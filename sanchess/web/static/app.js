@@ -19,8 +19,10 @@ async function api(path, opts){
   }catch(e){ conn(false); throw e; }
 }
 function esc(s){ return String(s??"").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
-function pct(x){ return `${Math.round(Math.max(0, Math.min(1, Number(x)||0))*100)}%`; }
+function clamp(x, a, b){ return Math.max(a, Math.min(b, Number(x)||0)); }
+function pct(x){ return `${Math.round(clamp(x, 0, 1)*100)}%`; }
 function fmtInt(x){ return Number(x||0).toLocaleString("fr-FR"); }
+function fmtFloat(x, d=1){ return Number(x||0).toLocaleString("fr-FR", {maximumFractionDigits:d, minimumFractionDigits:d}); }
 function sideName(s){ return s==="white" ? "Blancs" : "Noirs"; }
 async function copyText(txt, msg){
   try{
@@ -80,6 +82,12 @@ function setEval(el, winProb){ // winProb du point de vue des Blancs
   el.style.height = Math.max(2, Math.min(98, winProb*100)).toFixed(1) + "%";
 }
 function fmtCp(cp){ if(cp===null||cp===undefined) return "—"; const s=(cp/100).toFixed(2); return cp>0?"+"+s:s; }
+function statusLabel(result, reason){
+  if(result && result!=="*") return result==="1-0"?"Blancs gagnent":result==="0-1"?"Noirs gagnent":"Nulle";
+  if(reason==="max_plies") return "limite atteinte";
+  if(reason==="no_move") return "aucun coup";
+  return "en attente";
+}
 
 /* ---------------- Modèles (selects + table) ---------------- */
 let MODELS = [];
@@ -291,65 +299,145 @@ async function runAnalyze(){
 }
 
 /* ================= REGARDER (selfplay streaming) ================= */
-let watchWs=null, watchMoves=[];
-function watchStart(){
-  watchStop();
-  watchMoves=[]; pushMoveList($("#watch-movelist"), []);
+let watchWs=null;
+const watch = {state:"idle", moves:[], cp:[], wp:[], nps:[], visits:[]};
+
+function setWatchState(state, label){
+  watch.state = state;
+  $("#watch-state").textContent = label || state;
+  $("#watch-start").disabled = state==="connecting" || state==="running" || state==="stopping";
+  $("#watch-stop").disabled = !(state==="connecting" || state==="running");
+}
+function resetWatchCharts(){
+  for(const id of ["#watch-chart-cp","#watch-chart-wp","#watch-chart-nps","#watch-chart-visits"]){
+    lineChart($(id), [], [], "");
+  }
+}
+function drawWatchCharts(){
+  const xs = watch.cp.map((_,i)=>i+1);
+  lineChart($("#watch-chart-cp"), xs, watch.cp, "");
+  lineChart($("#watch-chart-wp"), xs, watch.wp, "v", {unit:"%", fixed:0, yMin:0, yMax:100});
+  lineChart($("#watch-chart-nps"), xs, watch.nps, "o", {fixed:0});
+  lineChart($("#watch-chart-visits"), xs, watch.visits, "p", {fixed:0});
+}
+function resetWatchUi(){
+  watch.moves=[]; watch.cp=[]; watch.wp=[]; watch.nps=[]; watch.visits=[];
+  pushMoveList($("#watch-movelist"), []);
+  renderThinking($("#watch-thinking"), []);
   renderBoard($("#watch-board"), START_FEN, {});
   $("#watch-ply").textContent = "0 demi-coup";
+  $("#watch-result").textContent = "en attente";
+  $("#watch-cp").textContent = "—";
+  $("#watch-nps").textContent = "0";
+  $("#watch-visits").textContent = "0";
+  $("#watch-wp").textContent = "50%";
+  $("#watch-time").textContent = "0.0s";
+  setEval($("#watch-eval"), .5);
+  resetWatchCharts();
+}
+function watchStart(){
+  watchStop("reset");
+  resetWatchUi();
+  setWatchState("connecting", "connexion");
   $("#watch-result").textContent = "en direct";
+  $("#watch-status").textContent = "Connexion au flux self-play…";
   const proto = location.protocol==="https:"?"wss:":"ws:";
   watchWs = new WebSocket(`${proto}//${location.host}/ws/selfplay`);
-  $("#watch-start").disabled=true; $("#watch-stop").disabled=false;
-  watchWs.onopen = ()=>{ conn(true); watchWs.send(JSON.stringify({
-    model_white:$("#watch-white").value, model_black:$("#watch-black").value,
-    nodes:+$("#watch-nodes").value, max_plies:300 })); };
+  watchWs.onopen = ()=>{
+    conn(true);
+    setWatchState("running", "en direct");
+    watchWs.send(JSON.stringify({
+      model_white:$("#watch-white").value,
+      model_black:$("#watch-black").value,
+      nodes:+$("#watch-nodes").value,
+      max_plies:+$("#watch-max-plies").value
+    }));
+  };
   watchWs.onmessage = (ev)=>{
-    const m = JSON.parse(ev.data);
-    if(m.type==="start"){ $("#watch-status").textContent=`Blancs: ${m.white} · Noirs: ${m.black}`; }
-    else if(m.type==="move"){
+    let m;
+    try{ m = JSON.parse(ev.data); }
+    catch(e){ $("#watch-status").textContent = "Message WebSocket illisible."; return; }
+    if(m.type==="start"){
+      $("#watch-status").textContent=`Blancs: ${m.white} · Noirs: ${m.black} · limite ${m.max_plies} demi-coups`;
+    } else if(m.type==="move"){
       renderBoard($("#watch-board"), m.fen, {lastMove:m.uci});
-      // m.value est du point de vue du joueur QUI VIENT DE JOUER... non : analyze
-      // renvoie la valeur côté trait AVANT de jouer. m.turn = trait après le coup.
       const moverWasWhite = (m.turn==="black");
-      const wp = moverWasWhite? m.win_prob : 1-m.win_prob;
-      setEval($("#watch-eval"), wp);
-      const cpW = moverWasWhite? m.cp : -m.cp;
-      $("#watch-cp").textContent = fmtCp(cpW); $("#watch-nps").textContent = fmtInt(m.nps);
+      const wpWhite = moverWasWhite ? m.win_prob : 1-m.win_prob;
+      const cpWhite = moverWasWhite ? m.cp : -m.cp;
+      setEval($("#watch-eval"), wpWhite);
+      $("#watch-cp").textContent = fmtCp(cpWhite);
+      $("#watch-nps").textContent = fmtInt(m.nps);
       $("#watch-visits").textContent = fmtInt(m.visits);
-      $("#watch-wp").textContent = pct(wp);
+      $("#watch-wp").textContent = pct(wpWhite);
+      $("#watch-time").textContent = `${fmtFloat(m.elapsed||0, 1)}s`;
       $("#watch-ply").textContent = `${m.ply} demi-coup${m.ply>1?"s":""}`;
       renderThinking($("#watch-thinking"), m.top_moves);
-      watchMoves.push(m.san); pushMoveList($("#watch-movelist"), watchMoves);
+      watch.moves.push(m.san);
+      watch.cp.push(cpWhite);
+      watch.wp.push(Math.round(wpWhite*100));
+      watch.nps.push(m.nps||0);
+      watch.visits.push(m.visits||0);
+      pushMoveList($("#watch-movelist"), watch.moves);
+      drawWatchCharts();
     } else if(m.type==="gameover"){
-      $("#watch-status").textContent = `Fin · ${m.result} (${m.plies} demi-coups)`;
-      $("#watch-result").textContent = m.result;
-      watchStop();
-    } else if(m.type==="error"){ $("#watch-status").textContent="Erreur : "+m.error; watchStop(); }
+      $("#watch-status").textContent = `Fin · ${statusLabel(m.result, m.reason)} · ${m.plies} demi-coups`;
+      $("#watch-result").textContent = statusLabel(m.result, m.reason);
+      watchStop("ended");
+    } else if(m.type==="error"){
+      $("#watch-status").textContent = "Erreur : " + (m.error || "inconnue");
+      watchStop("error");
+    }
   };
-  watchWs.onclose = ()=>{ $("#watch-start").disabled=false; $("#watch-stop").disabled=true; };
-  watchWs.onerror = ()=>conn(false);
+  watchWs.onclose = ()=>{
+    if(watch.state==="running" || watch.state==="connecting") setWatchState("idle", "arrêté");
+    if(watchWs) watchWs = null;
+  };
+  watchWs.onerror = ()=>{
+    conn(false);
+    $("#watch-status").textContent = "Erreur de connexion WebSocket.";
+  };
 }
-function watchStop(){ if(watchWs){ try{watchWs.close();}catch(e){} watchWs=null; }
-  $("#watch-start").disabled=false; $("#watch-stop").disabled=true; }
+function watchStop(mode="user"){
+  const ws = watchWs;
+  watchWs = null;
+  if(ws){ try{ ws.close(); }catch(e){} }
+  if(mode==="ended") setWatchState("ended", "terminé");
+  else if(mode==="error") setWatchState("error", "erreur");
+  else if(mode==="reset") setWatchState("idle", "prêt");
+  else {
+    setWatchState("stopping", "arrêt…");
+    setTimeout(()=>{ if(!watchWs && watch.state==="stopping") setWatchState("idle", "arrêté"); }, 150);
+  }
+}
 
 /* ================= ENTRAINEMENT ================= */
-function lineChart(svg, xs, ys, klass=""){
+function lineChart(svg, xs, ys, klass="", opt={}){
   svg.innerHTML="";
   if(!ys || ys.length<2){ svg.innerHTML='<text x="300" y="100" text-anchor="middle">aucune donnée</text>'; return; }
-  const W=600,H=200,pad=28;
+  const vb = svg.viewBox && svg.viewBox.baseVal ? svg.viewBox.baseVal : null;
+  const W = vb?.width || 600, H = vb?.height || 200, pad=30;
   const xmin=xs[0], xmax=xs[xs.length-1]||1;
-  const ymin=Math.min(...ys), ymax=Math.max(...ys);
+  const rawMin=Math.min(...ys), rawMax=Math.max(...ys);
+  const spread = Math.max(1e-9, rawMax-rawMin);
+  const ymin=opt.yMin!==undefined ? opt.yMin : rawMin - spread*.08;
+  const ymax=opt.yMax!==undefined ? opt.yMax : rawMax + spread*.08;
   const sx=v=>pad+(W-2*pad)*((v-xmin)/((xmax-xmin)||1));
   const sy=v=>pad+(H-2*pad)*(1-((v-ymin)/((ymax-ymin)||1)));
+  const fmt = v => opt.fixed===0 ? Math.round(v).toString() : Number(v).toFixed(opt.fixed ?? 3);
   let g="";
-  for(let i=0;i<=4;i++){ const y=pad+(H-2*pad)*i/4; g+=`<line class="grid" x1="${pad}" y1="${y}" x2="${W-pad}" y2="${y}"/>`; }
+  for(let i=0;i<=4;i++){
+    const y=pad+(H-2*pad)*i/4;
+    g+=`<line class="grid" x1="${pad}" y1="${y}" x2="${W-pad}" y2="${y}"/>`;
+  }
   const pts = xs.map((x,i)=>`${sx(x).toFixed(1)},${sy(ys[i]).toFixed(1)}`).join(" ");
   svg.innerHTML = g +
+    `<polyline class="area ${klass}" points="${pad},${H-pad} ${pts} ${W-pad},${H-pad}"/>`+
     `<polyline class="line ${klass}" points="${pts}"/>`+
-    `<text x="${pad}" y="14">${ymax.toFixed(3)}</text>`+
-    `<text x="${pad}" y="${H-6}">${ymin.toFixed(3)}</text>`+
-    `<text x="${W-pad}" y="${H-6}" text-anchor="end">step ${xmax}</text>`;
+    `<circle class="point ${klass}" cx="${sx(xs[xs.length-1]).toFixed(1)}" cy="${sy(ys[ys.length-1]).toFixed(1)}" r="3"/>`+
+    `<text x="${pad}" y="16">${fmt(rawMax)}${opt.unit||""}</text>`+
+    `<text x="${pad}" y="${H-7}">${fmt(rawMin)}${opt.unit||""}</text>`+
+    `<text x="${W-pad}" y="16" text-anchor="end">${fmt(ys[ys.length-1])}${opt.unit||""}</text>`+
+    `<text x="${W-pad}" y="${H-7}" text-anchor="end">#${xmax}</text>`;
 }
 async function loadTraining(){
   const d = await api("/api/training?points=400");
@@ -374,6 +462,7 @@ async function loadTraining(){
 function card(k,v,sub=""){ return `<div class="card"><div class="k">${k}</div><div class="v">${v}</div>${sub}</div>`; }
 
 /* ================= SYSTEME ================= */
+const sysHist = {x:[], gpu:[], mem:[], t:0};
 async function loadSystem(){
   const d = await api("/api/system");
   const gpu = $("#sys-gpu");
@@ -403,6 +492,15 @@ async function loadSystem(){
   $("#sys-procs").innerHTML = d.processes.length? d.processes.map(p=>
     `<span class="chip on"><span class="led"></span>${esc(p.module)} · pid ${p.pid}</span>`).join("")
     : '<div class="empty">Aucun process sanchess en cours.</div>';
+
+  sysHist.t += 1;
+  const firstGpu = d.gpu[0];
+  sysHist.x.push(sysHist.t);
+  sysHist.gpu.push(firstGpu?.util_pct ?? 0);
+  sysHist.mem.push(firstGpu?.mem_total_mb ? firstGpu.mem_used_mb / firstGpu.mem_total_mb * 100 : 0);
+  for(const k of ["x","gpu","mem"]) if(sysHist[k].length > 80) sysHist[k].shift();
+  lineChart($("#sys-chart-gpu"), sysHist.x, sysHist.gpu, "", {unit:"%", fixed:0, yMin:0, yMax:100});
+  lineChart($("#sys-chart-mem"), sysHist.x, sysHist.mem, "v", {unit:"%", fixed:0, yMin:0, yMax:100});
 }
 
 /* ================= Onglets + auto-refresh ================= */

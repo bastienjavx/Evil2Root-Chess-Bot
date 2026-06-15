@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>San-o1 · Console</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=20260614c">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9822;</text></svg>">
 </head>
 <body>
@@ -135,6 +135,7 @@
       <div class="play-topline">
         <span id="watch-ply" class="pill">0 demi-coup</span>
         <span id="watch-result" class="pill">en attente</span>
+        <span id="watch-state" class="pill">prêt</span>
       </div>
       <div class="board-wrap">
         <div class="evalbar"><div class="evalbar-fill" id="watch-eval"></div></div>
@@ -158,6 +159,13 @@
           <option value="800">800</option>
         </select>
       </label>
+      <label>Demi-coups max
+        <select id="watch-max-plies" class="sel">
+          <option value="80">80</option>
+          <option value="160" selected>160</option>
+          <option value="300">300</option>
+        </select>
+      </label>
       <div class="eval-readout">
         <div class="big" id="watch-cp">—</div>
         <div class="muted">éval · <span id="watch-nps">0</span> nps</div>
@@ -165,6 +173,25 @@
       <div class="mini-grid">
         <div><span class="k">Visites</span><strong id="watch-visits">0</strong></div>
         <div><span class="k">Win prob</span><strong id="watch-wp">50%</strong></div>
+        <div><span class="k">Temps</span><strong id="watch-time">0.0s</strong></div>
+      </div>
+      <div class="chart-grid compact">
+        <div class="chart-card">
+          <h3>Évaluation</h3>
+          <svg id="watch-chart-cp" class="chart small" viewBox="0 0 600 160" preserveAspectRatio="none"></svg>
+        </div>
+        <div class="chart-card">
+          <h3>Win prob</h3>
+          <svg id="watch-chart-wp" class="chart small" viewBox="0 0 600 160" preserveAspectRatio="none"></svg>
+        </div>
+        <div class="chart-card">
+          <h3>NPS</h3>
+          <svg id="watch-chart-nps" class="chart small" viewBox="0 0 600 160" preserveAspectRatio="none"></svg>
+        </div>
+        <div class="chart-card">
+          <h3>Visites</h3>
+          <svg id="watch-chart-visits" class="chart small" viewBox="0 0 600 160" preserveAspectRatio="none"></svg>
+        </div>
       </div>
       <h3>Réflexion</h3>
       <table class="moves-table" id="watch-thinking"><tbody></tbody></table>
@@ -203,6 +230,7 @@
       </div>
       <div class="cards" id="train-cards"></div>
       <div id="train-logs" class="logline"></div>
+      <div class="chart-grid">
       <div class="chart-card">
         <h3>Pré-entraînement — perte politique</h3>
         <svg id="chart-policy" class="chart" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
@@ -215,6 +243,7 @@
         <h3>Online — perte</h3>
         <svg id="chart-online" class="chart" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
       </div>
+      </div>
     </div>
   </section>
 
@@ -226,6 +255,16 @@
         <label class="inline-check"><input type="checkbox" id="sys-auto" checked> auto-refresh</label>
       </div>
       <div class="cards" id="sys-gpu"></div>
+      <div class="chart-grid">
+        <div class="chart-card">
+          <h3>GPU — utilisation</h3>
+          <svg id="sys-chart-gpu" class="chart" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
+        </div>
+        <div class="chart-card">
+          <h3>GPU — mémoire</h3>
+          <svg id="sys-chart-mem" class="chart" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
+        </div>
+      </div>
       <h3>Entraînement</h3>
       <div class="cards" id="sys-training"></div>
       <h3>Services systemd</h3>
@@ -238,6 +277,6 @@
   </section>
 </main>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=20260614c"></script>
 </body>
 </html>
