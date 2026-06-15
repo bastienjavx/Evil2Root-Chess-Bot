@@ -13,6 +13,7 @@
 #   SANO1_BRANCH         branche à cloner                        (défaut: main)
 #   SANO1_WORKER_GPU_GAMES   parties GPU batchées                (défaut: auto)
 #   SANO1_WORKER_WORKERS     process de self-play en parallèle   (défaut: auto)
+#   SANO1_ALLOW_CPU      "1" pour autoriser le repli CPU si pas de CUDA (défaut: refuse)
 #   ... + toutes les SANO1_WORKER_* reconnues par worker.py (device, threads, etc.)
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
@@ -41,7 +42,40 @@ python -m pip install --no-cache-dir -q \
 
 NAME="${SANO1_WORKER_NAME:-vast-$(hostname)}"
 
-echo "[vast_onstart] San-o1 worker → $SANO1_SERVER (name=$NAME, device=auto)" | tee -a "$LOG"
+# ── Préflight CUDA ────────────────────────────────────────────────────────────
+# Sur un GPU Vast payant, lancer du self-play sur CPU est du gaspillage : si torch
+# ne voit pas le GPU, le worker en --device auto retombe SILENCIEUSEMENT sur CPU.
+# On vérifie ici et on s'arrête net (sauf SANO1_ALLOW_CPU=1) avec un diagnostic.
+echo "[vast_onstart] préflight CUDA…" | tee -a "$LOG"
+echo "── nvidia-smi ──" | tee -a "$LOG"
+(nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1 || echo "nvidia-smi indisponible") | tee -a "$LOG"
+CUDA_OK="$(python - <<'PY'
+try:
+    import torch
+    print("yes" if torch.cuda.is_available() else "no")
+    print(f"torch={torch.__version__} cuda_build={torch.version.cuda}")
+except Exception as e:
+    print("no"); print(f"import torch a échoué: {e}")
+PY
+)"
+echo "$CUDA_OK" | tee -a "$LOG"
+
+if ! echo "$CUDA_OK" | head -1 | grep -q "^yes$"; then
+  {
+    echo "[vast_onstart] ❌ CUDA INDISPONIBLE pour torch sur cette image."
+    echo "    Cause probable : image sans torch+CUDA, ou driver hôte trop ancien."
+    echo "    Utilise une image PyTorch CUDA, p.ex. : pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime"
+    echo "    (driver hôte requis : compatible avec la version CUDA de l'image)."
+    echo "    Pour forcer quand même le CPU (déconseillé sur GPU payant) : SANO1_ALLOW_CPU=1"
+  } | tee -a "$LOG"
+  if [ "${SANO1_ALLOW_CPU:-0}" != "1" ]; then
+    echo "[vast_onstart] worker NON lancé (évite de payer du GPU pour du CPU)." | tee -a "$LOG"
+    exit 1
+  fi
+  echo "[vast_onstart] SANO1_ALLOW_CPU=1 → lancement sur CPU malgré tout." | tee -a "$LOG"
+fi
+
+echo "[vast_onstart] San-o1 worker → $SANO1_SERVER (name=$NAME, device=${SANO1_WORKER_DEVICE:-auto})" | tee -a "$LOG"
 echo "[vast_onstart] logs: $LOG  | suivi: tail -f $LOG"
 
 # Lancement en tâche de fond : l'onstart se termine, le worker continue.
