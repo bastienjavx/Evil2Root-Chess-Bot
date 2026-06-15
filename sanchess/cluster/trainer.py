@@ -13,15 +13,24 @@
                      (auth TRAINER_TOKEN). Les workers détectent la nouvelle version et
                      re-téléchargent : la boucle d'amélioration est bouclée.
 
+Avec `--fedavg`, le trainer bascule en mode MULTI-TRAINERS (federated averaging) : au
+lieu d'entraîner en continu et de publier seul, il entraîne `--local-steps` pas par
+round, envoie ses poids, puis le modèle moyenné de tous les trainers devient la nouvelle
+version (cf. `cluster/fedavg.py` et CLUSTER.md). Plusieurs machines peuvent alors
+partager le MÊME `TRAINER_TOKEN` sans s'écraser.
+
 Usage :
     TRAINER_TOKEN=monsecret python -m sanchess.cluster.trainer --server https://<app>.up.railway.app
     python -m sanchess.cluster.trainer --server http://localhost:8001 --token dev --no-train
+    # multi-trainers (sur chaque machine, même token) :
+    python -m sanchess.cluster.trainer --server https://<app>.up.railway.app --fedavg --trainer-id A
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -146,6 +155,20 @@ def main() -> None:
                     help="période de synchro des shards")
     ap.add_argument("--publish-sec", type=float, default=15.0, dest="publish_sec",
                     help="période de vérification de latest.pt pour publication")
+    # Federated averaging : PLUSIEURS trainers principaux (cf. CLUSTER.md).
+    ap.add_argument("--fedavg", action="store_true",
+                    default=os.environ.get("SANO1_FEDAVG", "") not in ("", "0"),
+                    help="mode multi-trainers : entraîne localement puis moyenne les "
+                         "poids avec les autres trainers (au lieu d'un publish solo)")
+    ap.add_argument("--local-steps", type=int,
+                    default=int(os.environ.get("SANO1_FED_LOCAL_STEPS", 400)),
+                    dest="local_steps",
+                    help="pas de gradient locaux par round avant la moyenne FedAvg")
+    ap.add_argument("--trainer-id", default=os.environ.get("SANO1_TRAINER_ID", ""),
+                    dest="trainer_id",
+                    help="identité stable de CE trainer (défaut : nom d'hôte)")
+    ap.add_argument("--fed-batch-size", type=int, default=None, dest="fed_batch_size",
+                    help="surcharge online.batch_size pour l'entraînement FedAvg")
     args = ap.parse_args()
 
     if not args.token:
@@ -159,6 +182,28 @@ def main() -> None:
     print(f"[trainer] serveur={server} | buffer={buffer_dir} | latest={latest}", flush=True)
 
     stop = threading.Event()
+    # En FedAvg, le publish est fait par le finalizer dans la boucle de round : pas de
+    # _publish_loop (il dupliquerait/écraserait), et online.py est remplacé par la boucle
+    # FedAvg qui contrôle le nb de pas et recharge le modèle moyenné entre les rounds.
+    if args.fedavg:
+        from . import fedavg
+        trainer_id = args.trainer_id or socket.gethostname()
+        threading.Thread(target=_sync_shards,
+                         args=(server, buffer_dir, stop, args.sync_sec),
+                         daemon=True).start()
+        print(f"[trainer] mode FedAvg : trainer_id={trainer_id} "
+              f"local_steps={args.local_steps}", flush=True)
+        try:
+            fedavg.run_fedavg(server, args.token, cfg, trainer_id=trainer_id,
+                              local_steps=args.local_steps, stop=stop,
+                              batch_size=args.fed_batch_size,
+                              seed_shards=args.seed_shards)
+        except KeyboardInterrupt:
+            print("\n[trainer] arrêt…", flush=True)
+        finally:
+            stop.set()
+        return
+
     threads = [
         threading.Thread(target=_sync_shards,
                          args=(server, buffer_dir, stop, args.sync_sec), daemon=True),

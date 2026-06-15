@@ -216,3 +216,127 @@ def test_buffer_rotation_caps_shards(client):
         _upload(c, _make_shard(), name="r", worker_id=f"w{i}")
     remaining = list(server.INCOMING_DIR.glob("*.txt.gz"))
     assert len(remaining) <= 5
+
+
+# --- Federated averaging (plusieurs trainers) --------------------------------
+
+_AUTH = {"Authorization": f"Bearer {TRAINER_TOKEN}"}
+
+
+def _contribute(c, tid, base_version=0, num_samples=10, blob=b"\x80\x02weights"):
+    return c.post("/cluster/trainer/contribute",
+                  headers=_AUTH,
+                  files={"weights": ("w.pt", blob, "application/octet-stream")},
+                  data={"trainer_id": tid, "base_version": base_version,
+                        "num_samples": num_samples, "step": 1})
+
+
+def test_contribute_requires_token(client):
+    c, _ = client
+    r = c.post("/cluster/trainer/contribute",
+               files={"weights": ("w.pt", b"x", "application/octet-stream")},
+               data={"trainer_id": "A", "base_version": 0})
+    assert r.status_code == 401
+
+
+def test_contribute_rejects_stale_base_version(client):
+    c, _ = client
+    r = _contribute(c, "A", base_version=99)   # round.base_version == 0 au départ
+    assert r.status_code == 409
+    assert "périmée" in r.json()["error"]
+
+
+def test_round_lifecycle_and_finalizer(client):
+    c, _ = client
+    # Round initial : 1, aucune contribution.
+    rs = c.get("/cluster/trainer/round").json()
+    assert rs["round"] == 1 and rs["num_contributions"] == 0 and rs["closed"] is False
+    # Premier contributeur = finalizer désigné.
+    a = _contribute(c, "A").json()
+    assert a["is_finalizer"] is True and a["finalizer_id"] == "A"
+    b = _contribute(c, "B").json()
+    assert b["is_finalizer"] is False and b["num_contributions"] == 2
+    rs = c.get("/cluster/trainer/round").json()
+    assert sorted(rs["contributors"]) == ["A", "B"]
+
+
+def test_contributions_listing_and_download(client):
+    c, _ = client
+    _contribute(c, "A", num_samples=42, blob=b"AAAA")
+    listing = c.get("/cluster/trainer/contributions").json()
+    assert listing["round"] == 1
+    metas = {m["trainer_id"]: m for m in listing["contributions"]}
+    assert metas["A"]["num_samples"] == 42
+    dl = c.get("/cluster/trainer/contributions", params={"download": "A"})
+    assert dl.status_code == 200 and dl.content == b"AAAA"
+
+
+def test_quorum_closes_round(client, monkeypatch):
+    # FED_QUORUM=2 : le round ferme dès 2 contributions (pas besoin d'attendre la deadline).
+    import importlib
+    monkeypatch.setenv("FED_QUORUM", "2")
+    monkeypatch.setenv("FED_ROUND_TIMEOUT", "9999")
+    import sanchess.cluster.server as server
+    server = importlib.reload(server)
+    from fastapi.testclient import TestClient
+    with TestClient(server.app) as c:
+        # prev_contributors vide au round 1 -> expected = max(quorum, 0) = 2.
+        assert _contribute(c, "A").json()["closed"] is False
+        assert _contribute(c, "B").json()["closed"] is True
+
+
+def test_publish_round_guard_advances_and_is_idempotent(client):
+    c, _ = client
+    _contribute(c, "A", num_samples=5)
+    _contribute(c, "B", num_samples=15)
+    blob = b"\x80\x02averaged-model"
+    r = c.post("/cluster/model/publish", headers=_AUTH,
+               files={"model": ("weights.pt", blob, "application/octet-stream")},
+               data={"step": 10, "round": 1})
+    assert r.status_code == 200 and r.json()["version"] == 1
+    # Round avancé à 2, base_version = 1.
+    rs = c.get("/cluster/trainer/round").json()
+    assert rs["round"] == 2 and rs["base_version"] == 1 and rs["num_contributions"] == 0
+    # Re-publier le round 1 (finalizer en retard) -> 409 idempotent, version inchangée.
+    r2 = c.post("/cluster/model/publish", headers=_AUTH,
+                files={"model": ("weights.pt", blob, "application/octet-stream")},
+                data={"step": 10, "round": 1})
+    assert r2.status_code == 409
+    assert c.get("/cluster/model/current").json()["version"] == 1
+
+
+def test_seed_publish_aligns_round_base_version(client):
+    # publish sans round (=-1, mono-trainer/amorçage) : la base du round suit la version.
+    c, _ = client
+    c.post("/cluster/model/publish", headers=_AUTH,
+           files={"model": ("weights.pt", b"seed", "application/octet-stream")},
+           data={"step": 1})
+    rs = c.get("/cluster/trainer/round").json()
+    assert rs["round"] == 1 and rs["base_version"] == 1
+    # Une contribution avec la bonne base passe alors.
+    assert _contribute(c, "A", base_version=1).status_code == 200
+
+
+def test_stats_expose_round_and_trainers(client):
+    c, _ = client
+    _contribute(c, "A")
+    s = c.get("/cluster/stats").json()
+    assert s["model_round"] == 1 and s["active_trainers"] == 1
+
+
+# --- Moyenne des poids (côté torch) ------------------------------------------
+
+def test_average_state_dicts_weighted():
+    torch = pytest.importorskip("torch")
+    from sanchess.cluster.fedavg import average_state_dicts
+    p1 = {"model_state": {"w": torch.tensor([0.0, 0.0]),
+                          "bn.num_batches_tracked": torch.tensor(3)},
+          "model_cfg": {"k": 1}, "step": 5}
+    p2 = {"model_state": {"w": torch.tensor([4.0, 8.0]),
+                          "bn.num_batches_tracked": torch.tensor(9)},
+          "model_cfg": {"k": 1}, "step": 7}
+    avg = average_state_dicts([p1, p2], [1.0, 3.0])   # 3/4 de poids sur p2
+    assert torch.allclose(avg["model_state"]["w"], torch.tensor([3.0, 6.0]))
+    # Buffer entier : copié du contributeur dominant (p2, plus de samples), pas moyenné.
+    assert int(avg["model_state"]["bn.num_batches_tracked"]) == 9
+    assert avg["step"] == 7

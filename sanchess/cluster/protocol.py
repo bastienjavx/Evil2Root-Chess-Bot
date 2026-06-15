@@ -19,11 +19,18 @@ EP_UPLOAD = f"{API_PREFIX}/upload"
 EP_SHARDS = f"{API_PREFIX}/shards"
 EP_STATS = f"{API_PREFIX}/stats"
 EP_HISTORY = f"{API_PREFIX}/history"
+# Federated averaging (plusieurs trainers ; cf. CLUSTER.md). Réservés au trainer
+# (protégés par TRAINER_TOKEN comme EP_MODEL_PUBLISH).
+EP_ROUND = f"{API_PREFIX}/trainer/round"           # GET : état du round courant
+EP_CONTRIBUTE = f"{API_PREFIX}/trainer/contribute"  # POST : poids locaux d'un trainer
+EP_CONTRIBUTIONS = f"{API_PREFIX}/trainer/contributions"  # GET : liste / ?download=<id>
 
 # --- Noms de fichiers / agencement du Volume ---------------------------------
 MODEL_FILENAME = "weights.pt"        # checkpoint weights-only servi aux workers
 MODEL_META_FILENAME = "weights.json"  # métadonnées (version, step, sha256, size)
 INCOMING_DIRNAME = "incoming"        # shards reçus des workers (buffer glissant)
+ROUNDS_DIRNAME = "rounds"            # rounds/<R>/<trainer_id>.pt (+ .json méta) : FedAvg
+ROUND_META_FILENAME = "round.json"   # état du round courant (numéro, base_version…)
 DB_FILENAME = "pool.sqlite"          # registre workers + leaderboard + compteurs
 
 # --- Garde-fous (valeurs par défaut ; surchargées par env côté serveur) ------
@@ -33,6 +40,11 @@ DEFAULT_MAX_SHARD_LINES = 200_000             # lignes max par shard
 DEFAULT_VALIDATE_SAMPLE = 64                  # nb de lignes vérifiées (FEN+coup légal)
 DEFAULT_MAX_SHARDS = 4000                     # rotation du buffer (plus vieux supprimés)
 DEFAULT_UPLOADS_PER_MIN = 120                 # rate-limit par IP
+
+# --- Federated averaging (réglables par env côté serveur) --------------------
+DEFAULT_FED_ROUND_TIMEOUT = 180   # s : ferme le round même si tous n'ont pas contribué
+DEFAULT_FED_QUORUM = 1            # contributions min pour fermer tôt (1 = mono-trainer OK)
+DEFAULT_FED_FINALIZE_GRACE = 60   # s après deadline avant qu'un AUTRE trainer puisse finaliser
 
 
 def _coerce(cls, data: dict):
@@ -90,6 +102,35 @@ class ModelInfo:
 
 
 @dataclass
+class RoundInfo:
+    """État d'un round de federated averaging. Les trainers entraînent localement à
+    partir de `base_version`, contribuent leurs poids, puis le round se ferme (quorum
+    ou deadline) et UN finalizer moyenne + publie -> nouvelle version, round suivant.
+
+    `closed` : la fenêtre de contribution est finie (le finalizer désigné peut moyenner).
+    `can_finalize` : vrai aussi pour un AUTRE trainer après le délai de grâce (reprise si
+    le finalizer désigné est mort). La correction vient de la garde idempotente du
+    publish (un seul publish accepté par round), pas de ces drapeaux."""
+    round: int = 1
+    base_version: int = 0
+    started_at: float = 0.0
+    deadline: float = 0.0
+    expected: int = 1
+    finalizer_id: str = ""
+    num_contributions: int = 0
+    contributors: list = field(default_factory=list)
+    closed: bool = False
+    can_finalize: bool = False
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "RoundInfo":
+        return _coerce(cls, data or {})
+
+
+@dataclass
 class UploadAck:
     """Réponse à un upload accepté."""
     ok: bool = True
@@ -107,6 +148,8 @@ class Stats:
     """Instantané exposé par /cluster/stats et le dashboard."""
     model_version: int = 0
     model_step: int = 0
+    model_round: int = 1          # round FedAvg courant (1 si mono-trainer)
+    active_trainers: int = 0      # trainers ayant contribué au round courant
     has_model: bool = False
     model_published_at: float = 0.0
     total_games: int = 0
