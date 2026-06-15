@@ -17,8 +17,10 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 DATA = ROOT / "data"
 
 # step  207000 | policy 1.6184 | value 0.7889 | 3.5 steps/s
+# step   53300 | policy 1.5650 | value 0.8311 | lr 9.87e-04 | 7.3 steps/s  (champ lr optionnel)
 _PRETRAIN_RE = re.compile(
-    r"step\s+(\d+)\s*\|\s*policy\s+([\d.]+)\s*\|\s*value\s+([\d.]+)\s*\|\s*([\d.]+)\s*steps/s")
+    r"step\s+(\d+)\s*\|\s*policy\s+([\d.]+)\s*\|\s*value\s+([\d.]+)\s*\|"
+    r"(?:\s*lr\s+[\d.eE+-]+\s*\|)?\s*([\d.]+)\s*steps/s")
 # online step 1234 | loss 0.1234 | buffer 50000
 _ONLINE_RE = re.compile(
     r"online step\s+(\d+)\s*\|\s*loss\s+([\d.]+)\s*\|\s*buffer\s+(\d+)")
@@ -42,11 +44,16 @@ def _tail_lines(path: Path, n: int = 4000) -> list[str]:
 
 
 def _latest_log(prefix: str) -> Path | None:
-    link = DATA / f"{prefix}_latest.log"
-    if link.exists():
-        return link
-    cands = sorted(DATA.glob(f"{prefix}_*.log"))
-    return cands[-1] if cands else None
+    """Log d'entraînement le plus récemment écrit.
+
+    On se fie à la date de modification plutôt qu'au symlink `*_latest.log`
+    (qui peut pointer vers un ancien run) : la page doit refléter
+    l'entraînement *en cours*.
+    """
+    cands = [p for p in DATA.glob(f"{prefix}_*.log") if p.exists()]
+    if not cands:
+        return None
+    return max(cands, key=lambda p: p.stat().st_mtime)
 
 
 def training_series(max_points: int = 400) -> dict:

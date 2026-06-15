@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import queue
+import threading
 from pathlib import Path
 
 import chess
@@ -70,8 +72,29 @@ def _board_from(fen: str | None, moves: list[str] | None) -> chess.Board:
 
 
 def _run(fn, *a, **k):
-    """Exécute un appel bloquant (MCTS/Torch) dans le threadpool."""
-    return asyncio.get_event_loop().run_in_executor(None, lambda: fn(*a, **k))
+    """Exécute un appel bloquant (MCTS/Torch) hors de la boucle asyncio."""
+    q: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+    def worker():
+        try:
+            q.put((True, fn(*a, **k)))
+        except Exception as exc:
+            q.put((False, exc))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    async def wait():
+        while True:
+            try:
+                ok, value = q.get_nowait()
+                break
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+        if ok:
+            return value
+        raise value
+
+    return wait()
 
 
 def _pgn_tag(value: str) -> str:
@@ -239,7 +262,8 @@ async def ws_selfplay(ws: WebSocket):
 
         await ws.send_json({"type": "start", "fen": board.fen(),
                             "white": (model_white or "latest"),
-                            "black": (model_black or "latest")})
+                            "black": (model_black or "latest"),
+                            "max_plies": max_plies})
 
         ply = 0
         while not board.is_game_over(claim_draw=True) and ply < max_plies and not stop:
@@ -257,15 +281,22 @@ async def ws_selfplay(ws: WebSocket):
                 "turn": "white" if board.turn == chess.WHITE else "black",
                 "cp": res["cp"], "value": res["value"], "win_prob": res["win_prob"],
                 "visits": res["root_visits"], "nps": res["nps"],
+                "elapsed": res.get("elapsed"), "model": res.get("model"),
                 "top_moves": res["top_moves"],
             })
             # laisse le temps au client de respirer / d'annuler
             await asyncio.sleep(0.01)
 
+        if board.is_game_over(claim_draw=True):
+            reason = "gameover"
+        elif ply >= max_plies:
+            reason = "max_plies"
+        else:
+            reason = "no_move"
         await ws.send_json({"type": "gameover", "fen": board.fen(),
                             "result": board.result(claim_draw=True)
                             if board.is_game_over(claim_draw=True) else "*",
-                            "plies": ply})
+                            "plies": ply, "reason": reason})
     except WebSocketDisconnect:
         return
     except Exception as exc:
@@ -278,7 +309,10 @@ async def ws_selfplay(ws: WebSocket):
 # --- Frontend statique --------------------------------------------------------
 @app.get("/")
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    # HTML toujours revalidé : garantit que les liens versionnés (?v=…) vers
+    # style.css / app.js sont à jour même si le navigateur a mis la page en cache.
+    return FileResponse(STATIC_DIR / "index.html",
+                        headers={"Cache-Control": "no-cache"})
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
